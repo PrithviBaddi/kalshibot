@@ -1,47 +1,16 @@
-import base64
 import os
 import time
 from urllib.parse import urlparse
 
 import httpx
-from cryptography.hazmat.backends import default_backend
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import padding
 from dotenv import load_dotenv
+
+from kalshi.signing import load_private_key_from_env, sign_pss_text
 
 load_dotenv()
 
 # Production; use https://demo-api.kalshi.co/trade-api/v2 for demo accounts
 DEFAULT_BASE = "https://api.elections.kalshi.com/trade-api/v2"
-
-
-def _load_private_key():
-    path = os.getenv("KALSHI_PRIVATE_KEY_PATH")
-    pem = os.getenv("KALSHI_PRIVATE_KEY")
-    if path:
-        with open(path, "rb") as f:
-            data = f.read()
-    elif pem:
-        data = pem.encode() if isinstance(pem, str) else pem
-    else:
-        raise ValueError(
-            "Set KALSHI_PRIVATE_KEY_PATH (path to .key file) or KALSHI_PRIVATE_KEY (PEM string)"
-        )
-    return serialization.load_pem_private_key(data, password=None, backend=default_backend())
-
-
-def _sign(private_key, timestamp: str, method: str, path: str) -> str:
-    path_without_query = path.split("?")[0]
-    message = f"{timestamp}{method}{path_without_query}".encode("utf-8")
-    signature = private_key.sign(
-        message,
-        padding.PSS(
-            mgf=padding.MGF1(hashes.SHA256()),
-            salt_length=padding.PSS.DIGEST_LENGTH,
-        ),
-        hashes.SHA256(),
-    )
-    return base64.b64encode(signature).decode("utf-8")
 
 
 class KalshiClient:
@@ -55,9 +24,21 @@ class KalshiClient:
         if not self.api_key_id:
             raise ValueError("Set KALSHI_API_KEY_ID (UUID from Kalshi API Keys page)")
 
-        self._private_key = _load_private_key()
+        self._private_key = load_private_key_from_env()
         resolved = base_url or os.getenv("KALSHI_API_BASE", DEFAULT_BASE)
         self.client = httpx.AsyncClient(base_url=resolved)
+
+    async def aclose(self):
+        await self.client.aclose()
+
+    @property
+    def signing_private_key(self):
+        """Same RSA key used for REST, WebSocket handshake, and request signing."""
+        return self._private_key
+
+    @property
+    def rest_base(self) -> str:
+        return str(self.client.base_url).rstrip("/")
 
     def _signing_path(self, method: str, path: str, **kwargs) -> str:
         """Path used in the signature (must match request URL path, no query string)."""
@@ -67,7 +48,7 @@ class KalshiClient:
     async def _request(self, method: str, path: str, **kwargs):
         sign_path = self._signing_path(method, path, **kwargs)
         timestamp = str(int(time.time() * 1000))
-        signature = _sign(self._private_key, timestamp, method, sign_path)
+        signature = sign_pss_text(self._private_key, timestamp, method, sign_path)
         headers = {
             "KALSHI-ACCESS-KEY": self.api_key_id,
             "KALSHI-ACCESS-SIGNATURE": signature,
@@ -83,11 +64,53 @@ class KalshiClient:
         print("✅ Authenticated to Kalshi (API key + RSA signature)")
         return resp.json()
 
-    async def get_markets(self, limit=100, cursor=None):
+    async def get_markets(
+        self,
+        limit=100,
+        cursor=None,
+        *,
+        series_ticker=None,
+        event_ticker=None,
+        mve_filter=None,
+        tickers=None,
+    ):
+        """GET /markets — see Kalshi docs for mve_filter, series_ticker, event_ticker."""
         params = {"limit": limit, "status": "open"}
         if cursor:
             params["cursor"] = cursor
+        if series_ticker:
+            params["series_ticker"] = series_ticker
+        if event_ticker:
+            params["event_ticker"] = event_ticker
+        if mve_filter:
+            params["mve_filter"] = mve_filter
+        if tickers:
+            params["tickers"] = tickers
         resp = await self._request("GET", "/markets", params=params)
+        resp.raise_for_status()
+        return resp.json()
+
+    async def get_market(self, ticker: str):
+        """Single market snapshot (REST); useful to compare with WebSocket ticker."""
+        resp = await self._request("GET", f"/markets/{ticker}")
+        resp.raise_for_status()
+        return resp.json()
+
+    async def get_series_list(
+        self,
+        category: str | None = None,
+        tags: str | None = None,
+        include_volume: bool = False,
+    ):
+        """GET /series — discover `series_ticker` values by category/tags (politics, weather, etc.)."""
+        params: dict = {}
+        if category:
+            params["category"] = category
+        if tags:
+            params["tags"] = tags
+        if include_volume:
+            params["include_volume"] = "true"
+        resp = await self._request("GET", "/series", params=params)
         resp.raise_for_status()
         return resp.json()
 
