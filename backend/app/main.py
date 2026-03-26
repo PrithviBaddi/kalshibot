@@ -10,15 +10,34 @@ from typing import Annotated, Literal
 import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Path, Query, Request, WebSocket, WebSocketDisconnect
+from pydantic import BaseModel, Field
 
 from app.deps import Kalshi
-from app.scanner import top_opportunities
+from app.scanner import dedupe_markets_by_ticker, top_opportunities
+from app.strategy_store import get_config, update_config
 from app.ticker_hub import TickerHub
 from kalshi.client import KalshiClient
 
 load_dotenv()
 
 logger = logging.getLogger(__name__)
+
+
+class StrategyUpdateRequest(BaseModel):
+    bot_enabled: bool | None = None
+    paper_mode: bool | None = None
+    max_position_cents: int | None = Field(default=None, ge=1, le=1_000_000)
+    daily_loss_limit_cents: int | None = Field(default=None, ge=100, le=10_000_000)
+    min_volume: float | None = Field(default=None, ge=0)
+    max_spread: float | None = Field(default=None, ge=0, le=1)
+    notes: str | None = None
+    blocked_keywords: list[str] | None = None
+
+
+class OrderRiskCheckRequest(BaseModel):
+    ticker: str
+    price_cents: int = Field(ge=1, le=99)
+    count: int = Field(ge=1, le=100_000)
 
 
 @asynccontextmanager
@@ -179,46 +198,185 @@ async def get_market(
 async def scanner_opportunities(
     k: Kalshi,
     top_n: int = Query(20, ge=1, le=100, description="How many ranked opportunities to return."),
-    limit: int = Query(200, ge=1, le=200, description="How many markets to scan from current page."),
-    cursor: str | None = Query(None, description="Optional markets cursor to scan a different page."),
+    limit: int = Query(200, ge=1, le=200, description="Page size when using series_ticker + cursor."),
+    cursor: str | None = Query(
+        None,
+        description="Only for series_ticker mode: next page from Kalshi (bookmark). Ignored for category scans.",
+    ),
     min_volume: float = Query(0.0, ge=0, description="Minimum volume filter."),
     max_spread: float = Query(1.0, ge=0, le=1, description="Maximum yes bid/ask spread."),
     mve_filter: Literal["only", "exclude"] | None = Query("exclude"),
-    series_ticker: str | None = Query(None),
-    include_sports: bool = Query(
-        False,
-        description="If false (default), sports markets are filtered out.",
+    series_ticker: str | None = Query(
+        None,
+        description="Kalshi series ticker: scans one series (supports cursor pagination).",
+    ),
+    category: str | None = Query(
+        None,
+        description="Official Kalshi series category — same as GET /api/v1/series?category=...",
+    ),
+    categories: str | None = Query(
+        None,
+        description="Comma-separated categories, e.g. Politics,Economics. Uses Kalshi /series per category.",
+    ),
+    max_series: int = Query(40, ge=1, le=200, description="Max distinct series to query in category mode."),
+    per_series_limit: int = Query(
+        50,
+        ge=1,
+        le=200,
+        description="Markets fetched per series in category mode.",
     ),
 ):
     """
-    Stage 4 scanner: returns a clean, ranked list from the raw Kalshi page.
-    This is not a predictive model yet — it surfaces liquid + tighter markets first.
+    Stage 4 scanner: ranked list using **Kalshi’s** scoping — not keyword guessing.
+
+    - **category** / **categories**: `GET /series?category=` then `GET /markets?series_ticker=` for each series.
+    - **series_ticker**: one series; optional **cursor** for the next page of that series.
     """
-    data = await k.get_markets(
-        limit=limit,
-        cursor=cursor,
-        mve_filter=mve_filter,
-        series_ticker=series_ticker,
-    )
-    markets = data.get("markets", [])
+    if series_ticker and (category or categories):
+        raise HTTPException(
+            status_code=400,
+            detail="Use either series_ticker (one series) or category/categories — not both.",
+        )
+
+    if series_ticker:
+        data = await k.get_markets(
+            limit=limit,
+            cursor=cursor,
+            mve_filter=mve_filter,
+            series_ticker=series_ticker,
+        )
+        markets = data.get("markets", [])
+        return {
+            "scan_mode": "series_ticker",
+            "scanned_count": len(markets),
+            "filters": {
+                "min_volume": min_volume,
+                "max_spread": max_spread,
+                "mve_filter": mve_filter,
+                "series_ticker": series_ticker,
+                "category": None,
+                "categories": None,
+                "max_series": None,
+                "per_series_limit": None,
+            },
+            "cursor": data.get("cursor"),
+            "note": "Use cursor from this response for the next page of the same series_ticker.",
+            "opportunities": top_opportunities(
+                markets,
+                top_n=top_n,
+                min_volume=min_volume,
+                max_spread=max_spread,
+            ),
+        }
+
+    cats: list[str] = []
+    if category:
+        cats.append(category.strip())
+    if categories:
+        cats.extend([c.strip() for c in categories.split(",") if c.strip()])
+    cats = [c for c in cats if c]
+
+    if not cats:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Scope the scan using Kalshi’s taxonomy: pass category= or categories= "
+                "(see GET /api/v1/series), or pass series_ticker= for one series. "
+                "Kalshi does not support category= on GET /markets; use /series first."
+            ),
+        )
+
+    if cursor:
+        raise HTTPException(
+            status_code=400,
+            detail="cursor only applies when series_ticker is set. Category scans merge many series; use series_ticker + cursor to paginate one series.",
+        )
+
+    series_seen: dict[str, dict] = {}
+    for cat in cats:
+        if len(series_seen) >= max_series:
+            break
+        ser = await k.get_series_list(category=cat)
+        for s in ser.get("series", []):
+            t = s.get("ticker")
+            if t and t not in series_seen:
+                series_seen[t] = s
+            if len(series_seen) >= max_series:
+                break
+
+    all_markets: list[dict] = []
+    for st in list(series_seen.keys()):
+        d = await k.get_markets(
+            limit=per_series_limit,
+            mve_filter=mve_filter,
+            series_ticker=st,
+        )
+        all_markets.extend(d.get("markets", []))
+
+    markets = dedupe_markets_by_ticker(all_markets)
+
     return {
+        "scan_mode": "kalshi_category",
         "scanned_count": len(markets),
         "filters": {
             "min_volume": min_volume,
             "max_spread": max_spread,
             "mve_filter": mve_filter,
-            "series_ticker": series_ticker,
-            "include_sports": include_sports,
+            "series_ticker": None,
+            "category": category,
+            "categories": categories,
+            "max_series": max_series,
+            "per_series_limit": per_series_limit,
         },
-        "cursor": data.get("cursor"),
-        "note": "Increase min_volume and lower max_spread for stricter candidates.",
+        "series_fetched": len(series_seen),
+        "categories_resolved": cats,
+        "cursor": None,
+        "note": "Category mode has no single cursor. To paginate one series, call with series_ticker= that series and use cursor from that response.",
         "opportunities": top_opportunities(
             markets,
             top_n=top_n,
             min_volume=min_volume,
             max_spread=max_spread,
-            include_sports=include_sports,
         ),
+    }
+
+
+@app.get("/api/v1/strategy")
+async def get_strategy():
+    """Stage 5: current bot strategy/risk settings."""
+    return get_config().to_dict()
+
+
+@app.put("/api/v1/strategy")
+async def put_strategy(body: StrategyUpdateRequest):
+    """Stage 5: update strategy/risk knobs (in-memory for now)."""
+    cfg = update_config(**body.model_dump())
+    return {"ok": True, "strategy": cfg.to_dict()}
+
+
+@app.post("/api/v1/risk/check-order")
+async def risk_check_order(body: OrderRiskCheckRequest):
+    """
+    Stage 5: pre-trade guardrails.
+    Validates position size and mode rules before order placement is implemented.
+    """
+    cfg = get_config()
+    order_notional = body.price_cents * body.count
+    reasons: list[str] = []
+    if not cfg.bot_enabled:
+        reasons.append("bot is disabled")
+    if order_notional > cfg.max_position_cents:
+        reasons.append(
+            f"order notional {order_notional}c exceeds max_position_cents {cfg.max_position_cents}c"
+        )
+    blocked = [w for w in cfg.blocked_keywords if w.lower() in body.ticker.lower()]
+    if blocked:
+        reasons.append(f"ticker blocked by keywords: {', '.join(blocked)}")
+    return {
+        "allowed": len(reasons) == 0,
+        "reasons": reasons,
+        "paper_mode": cfg.paper_mode,
+        "order_notional_cents": order_notional,
     }
 
 
