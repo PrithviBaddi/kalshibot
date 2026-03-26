@@ -14,7 +14,8 @@ from pydantic import BaseModel, Field
 
 from app.deps import Kalshi
 from app.scanner import dedupe_markets_by_ticker, top_opportunities
-from app.strategy_store import get_config, update_config
+from app.db import init_db, insert_paper_order, list_paper_orders
+from app.strategy_store import get_config, init_strategy_from_db, update_config
 from app.ticker_hub import TickerHub
 from kalshi.client import KalshiClient
 
@@ -38,11 +39,38 @@ class OrderRiskCheckRequest(BaseModel):
     ticker: str
     price_cents: int = Field(ge=1, le=99)
     count: int = Field(ge=1, le=100_000)
+    daily_loss_cents: int | None = Field(
+        default=None,
+        ge=0,
+        description="Optional: how much you are down today in cents. Used to enforce daily_loss_limit_cents.",
+    )
+
+
+class PlaceOrderRequest(BaseModel):
+    """
+    Stage 6: safe order placement request.
+
+    IMPORTANT: `price_cents` is the price for the selected `side`.
+    - side="yes": price_cents is YES price
+    - side="no":  price_cents is NO price
+    """
+
+    ticker: str
+    side: Literal["yes", "no"]
+    price_cents: int = Field(ge=1, le=99)
+    count: int = Field(ge=1, le=100_000)
+    daily_loss_cents: int | None = Field(default=None, ge=0)
+    confirm_live: bool = Field(
+        default=False,
+        description="Only required when paper_mode is OFF. Prevents accidental real trading.",
+    )
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     try:
+        init_db()
+        init_strategy_from_db()
         app.state.kalshi = KalshiClient()
         logger.info("Kalshi client initialized (base URL from env or default production)")
         app.state.ticker_hub = TickerHub(
@@ -369,6 +397,10 @@ async def risk_check_order(body: OrderRiskCheckRequest):
         reasons.append(
             f"order notional {order_notional}c exceeds max_position_cents {cfg.max_position_cents}c"
         )
+    if body.daily_loss_cents is not None and body.daily_loss_cents >= cfg.daily_loss_limit_cents:
+        reasons.append(
+            f"daily loss limit hit: daily_loss_cents {body.daily_loss_cents}c >= daily_loss_limit_cents {cfg.daily_loss_limit_cents}c"
+        )
     blocked = [w for w in cfg.blocked_keywords if w.lower() in body.ticker.lower()]
     if blocked:
         reasons.append(f"ticker blocked by keywords: {', '.join(blocked)}")
@@ -378,6 +410,139 @@ async def risk_check_order(body: OrderRiskCheckRequest):
         "paper_mode": cfg.paper_mode,
         "order_notional_cents": order_notional,
     }
+
+
+def _compute_risk_reasons(
+    cfg,
+    *,
+    ticker: str,
+    price_cents: int,
+    count: int,
+    daily_loss_cents: int | None,
+) -> tuple[bool, list[str], int, bool]:
+    """
+    Shared risk logic for Stage 5 and Stage 6.
+
+    Returns: (allowed, reasons, order_notional_cents, paper_mode)
+    """
+    reasons: list[str] = []
+    order_notional = price_cents * count
+
+    if not cfg.bot_enabled:
+        reasons.append("bot is disabled")
+
+    if order_notional > cfg.max_position_cents:
+        reasons.append(
+            f"order notional {order_notional}c exceeds max_position_cents {cfg.max_position_cents}c"
+        )
+
+    if daily_loss_cents is not None and daily_loss_cents >= cfg.daily_loss_limit_cents:
+        reasons.append(
+            f"daily loss limit hit: daily_loss_cents {daily_loss_cents}c >= daily_loss_limit_cents {cfg.daily_loss_limit_cents}c"
+        )
+
+    blocked = [w for w in cfg.blocked_keywords if w.lower() in ticker.lower()]
+    if blocked:
+        reasons.append(f"ticker blocked by keywords: {', '.join(blocked)}")
+
+    allowed = len(reasons) == 0
+    return allowed, reasons, order_notional, cfg.paper_mode
+
+
+@app.post("/api/v1/orders/place")
+async def place_order(body: PlaceOrderRequest, request: Request):
+    """
+    Stage 6: Place order in paper mode only (safe path).
+
+    If `paper_mode` is OFF, the request must set `confirm_live=true` to allow
+    a real `POST /orders` call to Kalshi (kept off by default).
+    """
+    cfg = get_config()
+
+    # First run the same checks Stage 5 uses.
+    allowed, reasons, order_notional, paper_mode = _compute_risk_reasons(
+        cfg,
+        ticker=body.ticker,
+        price_cents=body.price_cents,
+        count=body.count,
+        daily_loss_cents=body.daily_loss_cents,
+    )
+
+    if not allowed:
+        return {
+            "allowed": False,
+            "reasons": reasons,
+            "paper_mode": paper_mode,
+            "order_notional_cents": order_notional,
+            "paper": True,
+        }
+
+    # If paper_mode is off, we still require an explicit confirmation flag.
+    if not paper_mode:
+        if not body.confirm_live:
+            return {
+                "allowed": False,
+                "reasons": ["paper_mode is off and confirm_live=false"],
+                "paper_mode": paper_mode,
+                "order_notional_cents": order_notional,
+                "paper": True,
+            }
+
+    # Paper mode: do not call Kalshi.
+    if paper_mode:
+        yes_price = body.price_cents if body.side == "yes" else 100 - body.price_cents
+        no_price = body.price_cents if body.side == "no" else 100 - body.price_cents
+        record = {
+            "ticker": body.ticker,
+            "side": body.side,
+            "price_cents": body.price_cents,
+            "count": body.count,
+            "order_notional_cents": order_notional,
+            "paper_mode": True,
+        }
+        order_id = insert_paper_order(payload=record)
+        return {
+            "allowed": True,
+            "paper": True,
+            "paper_mode": True,
+            "order_notional_cents": order_notional,
+            "paper_order_id": order_id,
+            "would_place": {
+                "ticker": body.ticker,
+                "side": body.side,
+                "count": body.count,
+                "yes_price_cents": yes_price,
+                "no_price_cents": no_price,
+            },
+        }
+
+    # Live mode (confirm_live must be true): call Kalshi.
+    k = getattr(request.app.state, "kalshi", None)
+    if k is None:
+        return {
+            "allowed": False,
+            "reasons": ["kalshi client not configured in server lifespan"],
+            "paper_mode": False,
+            "order_notional_cents": order_notional,
+            "paper": True,
+        }
+
+    # Send the order to Kalshi.
+    # This is intentionally not used unless paper_mode is OFF + confirm_live=true.
+    resp = await k.place_order(body.ticker, body.side, body.count, body.price_cents)
+    return {
+        "allowed": True,
+        "paper": False,
+        "paper_mode": False,
+        "order_notional_cents": order_notional,
+        "result": resp,
+    }
+
+
+@app.get("/api/v1/paper/orders")
+async def get_paper_orders(limit: int = Query(100, ge=1, le=500)):
+    """Stage 7: view paper orders persisted in SQLite."""
+    return {"orders": list_paper_orders(limit=limit)}
 
 
 @app.websocket("/api/v1/ws/ticker")

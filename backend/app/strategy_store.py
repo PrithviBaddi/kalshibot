@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 
+from app.db import load_strategy, save_strategy
+
 
 @dataclass
 class StrategyConfig:
@@ -23,6 +25,19 @@ class StrategyConfig:
 _CONFIG = StrategyConfig()
 
 
+def init_strategy_from_db() -> None:
+    """Load persisted strategy (if present) into the in-memory config."""
+    data = load_strategy()
+    if not data:
+        return
+    update_config(**data)
+
+
+def persist_strategy_to_db() -> None:
+    """Persist the current in-memory strategy to the DB."""
+    save_strategy(get_config().to_dict())
+
+
 def get_config() -> StrategyConfig:
     return _CONFIG
 
@@ -32,4 +47,5 @@ def update_config(**kwargs) -> StrategyConfig:
     for k, v in kwargs.items():
         if v is not None and hasattr(cfg, k):
             setattr(cfg, k, v)
+    persist_strategy_to_db()
     return cfg
