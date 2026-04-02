@@ -5,4 +5,6 @@ __pycache__/
 .DS_Store
 node_modules/
 .next/
+frontend/node_modules/
+frontend/.next/
 backend/kalshibot.db

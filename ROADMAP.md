@@ -109,11 +109,19 @@ Simple plan from “nothing works” to “shippable product.” Each stage has 
 
 **Goal:** User-defined rules (max size, categories/series, spread/volume) drive scans and optional execution.
 
-**Planned:** Rule config in DB, evaluator that uses scanner + risk layer.
+**Implemented:** SQLite-stored rules + `run-once` evaluator that scans scoped markets and creates **paper** orders only.
+
+**Safety upgrade:** rules now use **safe templates** (example: `safe-liquidity`). You cannot create arbitrarily risky configs; the API validates caps (max spread, max size, max series, etc.).
 
 **How to know it passes**
 
-- Change a rule → next scan/run behaves differently without code edits.
+- `POST /api/v1/rules` creates a rule (returns `rule_id`).
+- `GET /api/v1/rules` lists it.
+- `POST /api/v1/rules/{rule_id}/run-once` returns:
+  - `paper_orders_created` (>= 0)
+  - an `orders` array with `allowed` flags
+- Paper orders show up in `GET /api/v1/paper/orders`.
+- Run a rule and confirm tickers/fields match the rule config via `backend/validation/stage8_validation.py`.
 
 ---
 
@@ -121,11 +129,15 @@ Simple plan from “nothing works” to “shippable product.” Each stage has 
 
 **Goal:** Background workers: reconnect WS, periodic scans, rate-limit safety.
 
-**Planned:** Worker process or FastAPI `lifespan` tasks + queue optional (Redis).
+**Implemented:** A rules scheduler in FastAPI `lifespan` that periodically runs enabled Stage 8 rules in **paper mode**, plus:
+
+- `GET /api/v1/jobs/status`
+- `POST /api/v1/jobs/run-all-enabled-once`
 
 **How to know it passes**
 
 - Leave it running hours: WS reconnects; no memory leak obvious; API stays up.
+- Run `python3 backend/validation/stage9_validation.py` and confirm “Stage 9 validation PASSED”.
 
 ---
 
@@ -167,4 +179,4 @@ Simple plan from “nothing works” to “shippable product.” Each stage has 
 
 ### Where we are now (quick)
 
-Stages **1–6** are implemented in code; **4** now follows Kalshi’s category/series system for scoped scans. Stages **7–12** are the path to a full product.
+Stages **1–9** are implemented in code (Stages 4–8 use Kalshi taxonomy + templates + paper orders; Stage 9 adds the scheduler). Stages **10–12** are the remaining path to a full product.

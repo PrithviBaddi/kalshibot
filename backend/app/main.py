@@ -5,19 +5,40 @@ KalshiBot backend — Stage 2: REST shell; Stage 3: Kalshi WebSocket ticker fan-
 import asyncio
 import logging
 from contextlib import asynccontextmanager
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
+
+import os
 
 import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Path, Query, Request, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from app.deps import Kalshi
 from app.scanner import dedupe_markets_by_ticker, top_opportunities
-from app.db import init_db, insert_paper_order, list_paper_orders
+from app.db import (
+    create_rule,
+    init_db,
+    insert_paper_order,
+    insert_rule_run,
+    list_paper_orders,
+    list_rule_runs,
+    list_rule_runs_for_rule,
+    list_rules,
+    list_enabled_rules,
+    get_rule,
+    update_rule,
+)
 from app.strategy_store import get_config, init_strategy_from_db, update_config
+from app.templates import validate_rule_config
 from app.ticker_hub import TickerHub
 from kalshi.client import KalshiClient
+from app.jobs import (
+    get_scheduler_interval_seconds,
+    rules_scheduler_loop,
+    run_all_enabled_rules_once,
+)
 
 load_dotenv()
 
@@ -66,6 +87,50 @@ class PlaceOrderRequest(BaseModel):
     )
 
 
+class RuleConfigRequest(BaseModel):
+    """
+    Stage 8 (rules engine): defines how to pick markets and how to size a paper order.
+    This MVP uses Kalshi's official category->series->markets scanning.
+    """
+
+    category: str = Field(description="Kalshi series category (same string as /api/v1/series).")
+    mve_filter: Literal["only", "exclude"] = Field(default="exclude")
+    top_n: int = Field(default=10, ge=1, le=100)
+    min_volume: float = Field(default=0.0, ge=0)
+    max_spread: float = Field(default=1.0, ge=0, le=1)
+
+    # Speed knobs for MVP (keep runs fast).
+    max_series: int = Field(default=5, ge=1, le=200)
+    per_series_limit: int = Field(default=20, ge=1, le=200)
+
+    side: Literal["yes", "no"] = Field(default="yes")
+    price_source: Literal["yes_ask", "yes_bid", "mid"] = Field(default="yes_ask")
+
+    order_count: int = Field(default=1, ge=1, le=100_000)
+    max_trades_per_run: int = Field(default=3, ge=1, le=50)
+
+    # Internal: safe template used to constrain this rule.
+    template_id: str | None = Field(default=None, description="Internal template id used for validation.")
+
+
+class RuleCreateRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    enabled: bool = True
+    template_id: str = Field(default="safe-liquidity", description="Safe rule template id")
+    config: RuleConfigRequest
+
+
+class RuleUpdateRequest(BaseModel):
+    enabled: bool
+    name: str = Field(min_length=1, max_length=100)
+    template_id: str = Field(default="safe-liquidity", description="Safe rule template id")
+    config: RuleConfigRequest
+
+
+class RuleRunOnceRequest(BaseModel):
+    daily_loss_cents: int | None = Field(default=None, ge=0)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     try:
@@ -79,11 +144,28 @@ async def lifespan(app: FastAPI):
             app.state.kalshi.signing_private_key,
         )
         await app.state.ticker_hub.start()
+
+        # Stage 9 scheduler: periodically run enabled rules (paper-only).
+        interval_seconds = get_scheduler_interval_seconds()
+        app.state.rules_scheduler_task = asyncio.create_task(
+            rules_scheduler_loop(app, interval_seconds=interval_seconds),
+            name="rules-scheduler",
+        )
     except ValueError as e:
         app.state.kalshi = None
         app.state.ticker_hub = None
         logger.warning("Kalshi client disabled: %s", e)
     yield
+
+    # Stop Stage 9 scheduler.
+    sched_task = getattr(app.state, "rules_scheduler_task", None)
+    if sched_task is not None:
+        sched_task.cancel()
+        try:
+            await sched_task
+        except asyncio.CancelledError:
+            pass
+
     hub = getattr(app.state, "ticker_hub", None)
     if hub is not None:
         await hub.stop()
@@ -105,6 +187,22 @@ app = FastAPI(
     ),
     version="0.3.0",
     lifespan=lifespan,
+)
+
+_cors_origins = [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+]
+_extra = os.environ.get("CORS_ORIGINS", "").strip()
+if _extra:
+    _cors_origins.extend([o.strip() for o in _extra.split(",") if o.strip()])
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_cors_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
@@ -543,6 +641,312 @@ async def place_order(body: PlaceOrderRequest, request: Request):
 async def get_paper_orders(limit: int = Query(100, ge=1, le=500)):
     """Stage 7: view paper orders persisted in SQLite."""
     return {"orders": list_paper_orders(limit=limit)}
+
+
+#
+# Stage 10: dashboard-friendly endpoints (backend-only)
+#
+
+
+@app.get("/api/v1/dashboard/strategy")
+async def dashboard_strategy():
+    cfg = get_config()
+    return {"strategy": cfg.to_dict()}
+
+
+@app.get("/api/v1/dashboard/rules")
+async def dashboard_rules(limit: int = Query(100, ge=1, le=500)):
+    return {"rules": list_rules(limit=limit), "enabled_rules": list_enabled_rules(limit=limit)}
+
+
+@app.get("/api/v1/dashboard/rule-runs")
+async def dashboard_rule_runs(
+    limit: int = Query(50, ge=1, le=200),
+    rule_id: int | None = Query(None, description="Optional: filter rule runs by rule_id"),
+):
+    if rule_id is None:
+        return {"rule_runs": list_rule_runs(limit=limit)}
+    return {"rule_runs": list_rule_runs_for_rule(rule_id=rule_id, limit=limit)}
+
+
+@app.get("/api/v1/dashboard/paper-orders")
+async def dashboard_paper_orders(
+    limit: int = Query(50, ge=1, le=200),
+    rule_id: int | None = Query(None, description="Optional: filter paper orders by rule_id (from payload)"),
+):
+    orders = list_paper_orders(limit=limit)
+    if rule_id is not None:
+        orders = [o for o in orders if int(o.get("rule_id") or -1) == rule_id]
+    return {"paper_orders": orders}
+
+
+@app.get("/api/v1/dashboard/jobs")
+async def dashboard_jobs(request: Request):
+    task = getattr(request.app.state, "rules_scheduler_task", None)
+    return {
+        "running": bool(getattr(request.app.state, "rules_scheduler_running", False)),
+        "last_run_at": getattr(request.app.state, "rules_scheduler_last_run_at", None),
+        "task_alive": task is not None and not task.done(),
+        "last_result": getattr(request.app.state, "rules_scheduler_last_result", None),
+    }
+
+
+@app.get("/api/v1/jobs/status")
+async def jobs_status(request: Request):
+    """Stage 9: show scheduler status."""
+    task = getattr(request.app.state, "rules_scheduler_task", None)
+    return {
+        "rules_scheduler_running": bool(getattr(request.app.state, "rules_scheduler_running", False)),
+        "rules_scheduler_last_run_at": getattr(request.app.state, "rules_scheduler_last_run_at", None),
+        "rules_scheduler_task_alive": task is not None and not task.done(),
+    }
+
+
+@app.post("/api/v1/jobs/run-all-enabled-once")
+async def run_all_enabled_once_endpoint(
+    request: Request, daily_loss_cents: int | None = Query(None, ge=0)
+):
+    """Stage 9: manual trigger to run all enabled rules once."""
+    results = await run_all_enabled_rules_once(
+        app_state=request.app.state, daily_loss_cents=daily_loss_cents
+    )
+    return {"results": results}
+
+
+def _dollars_to_cents(x: float) -> int:
+    # Kalshi prices are in 0..1 dollars (e.g. 0.38 = 38 cents).
+    return int(round(x * 100))
+
+
+async def run_rule_once_internal(
+    *,
+    rule_id: int,
+    daily_loss_cents: int | None,
+    kalshi_client: Any,
+    cfg: Any,
+) -> dict[str, Any]:
+    """
+    Stage 8 rule runner, used by both the API endpoint and Stage 9 scheduler.
+
+    Runs the rule once and creates paper orders only.
+    """
+    rule = get_rule(rule_id)
+    if not rule:
+        return {"run_id": None, "allowed": False, "reasons": ["rule not found"]}
+
+    if not rule["enabled"]:
+        return {
+            "run_id": None,
+            "allowed": False,
+            "reasons": ["rule is disabled"],
+            "rule": rule,
+        }
+
+    if not cfg.paper_mode:
+        return {"run_id": None, "allowed": False, "reasons": ["paper_mode is off"]}
+
+    # Keep risk guardrails consistent.
+    rule_cfg = RuleConfigRequest(**rule["config"])
+
+    # Safety: ensure rule still matches its template constraints.
+    template_id = rule_cfg.template_id or "safe-liquidity"
+    try:
+        validate_rule_config(template_id, rule_cfg.model_dump())
+    except ValueError as e:
+        return {
+            "run_id": None,
+            "allowed": False,
+            "reasons": [str(e)],
+            "rule": rule,
+        }
+
+    # Resolve category -> series list (Kalshi taxonomy)
+    series_resp = await kalshi_client.get_series_list(category=rule_cfg.category)
+    series_list = series_resp.get("series", []) if isinstance(series_resp, dict) else []
+    series_tickers = [s.get("ticker") for s in series_list if s.get("ticker")]
+    series_tickers = series_tickers[: rule_cfg.max_series]
+
+    # Scan markets for each series_ticker (open markets slice)
+    all_markets: list[dict[str, Any]] = []
+    for st in series_tickers:
+        d = await kalshi_client.get_markets(
+            limit=rule_cfg.per_series_limit,
+            mve_filter=rule_cfg.mve_filter,
+            series_ticker=st,
+        )
+        all_markets.extend(d.get("markets", []))
+
+    markets = dedupe_markets_by_ticker(all_markets)
+
+    opportunities = top_opportunities(
+        markets,
+        top_n=rule_cfg.top_n,
+        min_volume=rule_cfg.min_volume,
+        max_spread=rule_cfg.max_spread,
+    )
+
+    orders_result: list[dict[str, Any]] = []
+    created = 0
+    created_tickers: list[str] = []
+
+    for opp in opportunities:
+        if created >= rule_cfg.max_trades_per_run:
+            break
+
+        # Convert price_source into a valid YES cents in 1..99.
+        if rule_cfg.price_source == "yes_ask":
+            candidates = [
+                ("yes_ask", opp.get("yes_ask")),
+                ("yes_bid", opp.get("yes_bid")),
+                ("mid", opp.get("mid_prob")),
+            ]
+        elif rule_cfg.price_source == "yes_bid":
+            candidates = [
+                ("yes_bid", opp.get("yes_bid")),
+                ("yes_ask", opp.get("yes_ask")),
+                ("mid", opp.get("mid_prob")),
+            ]
+        else:
+            candidates = [
+                ("mid", opp.get("mid_prob")),
+                ("yes_ask", opp.get("yes_ask")),
+                ("yes_bid", opp.get("yes_bid")),
+            ]
+
+        yes_cents: int | None = None
+        for _, v in candidates:
+            cents = _dollars_to_cents(float(v or 0.0))
+            if 1 <= cents <= 99:
+                yes_cents = cents
+                break
+        if yes_cents is None:
+            continue
+
+        order_price_cents = yes_cents if rule_cfg.side == "yes" else 100 - yes_cents
+        if order_price_cents < 1 or order_price_cents > 99:
+            continue
+
+        allowed, reasons, order_notional, paper_mode = _compute_risk_reasons(
+            cfg,
+            ticker=opp["ticker"],
+            price_cents=order_price_cents,
+            count=rule_cfg.order_count,
+            daily_loss_cents=daily_loss_cents,
+        )
+
+        if allowed and paper_mode:
+            record = {
+                "ticker": opp["ticker"],
+                "side": rule_cfg.side,
+                "price_cents": order_price_cents,
+                "count": rule_cfg.order_count,
+                "order_notional_cents": order_notional,
+                "paper_mode": True,
+                "rule_id": rule_id,
+                "opportunity_title": opp.get("title"),
+                "opportunity_score": opp.get("score"),
+            }
+            paper_order_id = insert_paper_order(payload=record)
+            created += 1
+            created_tickers.append(opp["ticker"])
+            orders_result.append(
+                {
+                    "paper_order_id": paper_order_id,
+                    "ticker": opp["ticker"],
+                    "side": rule_cfg.side,
+                    "price_cents": order_price_cents,
+                    "count": rule_cfg.order_count,
+                    "allowed": True,
+                    "reasons": [],
+                }
+            )
+        else:
+            orders_result.append(
+                {
+                    "ticker": opp["ticker"],
+                    "side": rule_cfg.side,
+                    "price_cents": order_price_cents,
+                    "count": rule_cfg.order_count,
+                    "allowed": False,
+                    "reasons": reasons,
+                }
+            )
+
+    result = {
+        "rule_id": rule_id,
+        "allowed": True,
+        "series_tickers_resolved": series_tickers,
+        "markets_scanned": len(markets),
+        "opportunities_ranked": len(opportunities),
+        "paper_orders_created": created,
+        "paper_order_tickers_created": created_tickers,
+        "orders": orders_result[: rule_cfg.max_trades_per_run],
+    }
+    run_db_id = insert_rule_run(rule_id=rule_id, result=result)
+    result["run_id"] = run_db_id
+    return result
+
+
+@app.post("/api/v1/rules")
+async def create_rule_endpoint(body: RuleCreateRequest):
+    """Stage 8: create a new trading rule (saved in SQLite)."""
+    cfg = body.config.model_dump()
+    cfg["template_id"] = body.template_id
+    try:
+        validate_rule_config(body.template_id, cfg)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    rule_id = create_rule(enabled=body.enabled, name=body.name, config=cfg)
+    return {"rule_id": rule_id}
+
+
+@app.get("/api/v1/rules")
+async def list_rules_endpoint(limit: int = Query(100, ge=1, le=500)):
+    """Stage 8: list rules."""
+    return {"rules": list_rules(limit=limit)}
+
+
+@app.get("/api/v1/rules/{rule_id}")
+async def get_rule_endpoint(rule_id: int):
+    """Stage 8: fetch a single rule."""
+    r = get_rule(rule_id)
+    if not r:
+        raise HTTPException(status_code=404, detail="Rule not found")
+    return r
+
+
+@app.put("/api/v1/rules/{rule_id}")
+async def update_rule_endpoint(rule_id: int, body: RuleUpdateRequest):
+    """Stage 8: update an existing rule."""
+    cfg = body.config.model_dump()
+    cfg["template_id"] = body.template_id
+    try:
+        validate_rule_config(body.template_id, cfg)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    update_rule(rule_id, enabled=body.enabled, name=body.name, config=cfg)
+    return {"ok": True}
+
+
+@app.post("/api/v1/rules/{rule_id}/run-once")
+async def run_rule_once_endpoint(
+    rule_id: int, body: RuleRunOnceRequest, request: Request
+):
+    """
+    Stage 8: run a rule once (one scan + up to N paper orders).
+
+    This does not place real orders. It only creates paper orders via SQLite.
+    """
+    k = getattr(request.app.state, "kalshi", None)
+    if k is None:
+        raise HTTPException(status_code=503, detail="Kalshi not configured")
+
+    return await run_rule_once_internal(
+        rule_id=rule_id,
+        daily_loss_cents=body.daily_loss_cents,
+        kalshi_client=k,
+        cfg=get_config(),
+    )
 
 
 @app.websocket("/api/v1/ws/ticker")
