@@ -1,0 +1,61 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>KalshiBot</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <div class="wrap">
+      <div class="header">
+        <div class="title">KalshiBot</div>
+        <div class="subtitle">Paper-only signals</div>
+      </div>
+
+      <div class="card">
+        <div class="label">Detected market</div>
+        <div class="value" id="market">—</div>
+        <div class="hint" id="marketHint">Open kalshi.com and select the market you want to paper-trade. We’ll detect the ticker automatically.</div>
+      </div>
+
+      <div class="card" id="optionsCard" style="display:none;">
+        <div class="label">Choose option</div>
+        <select id="optionsSelect"></select>
+        <button id="applyOption" class="btn">Use selected option</button>
+        <div class="hint">Some markets have many options. Pick the one you want a second opinion on.</div>
+      </div>
+
+      <div class="card">
+        <div class="label">Bot status</div>
+        <div class="value" id="botStatus">Loading…</div>
+      </div>
+
+      <div class="card">
+        <div class="label">Risk verdict (paper)</div>
+        <div class="grid">
+          <div class="sideBlock">
+            <div class="sideTitle">YES</div>
+            <div class="verdict" id="yesVerdict">—</div>
+            <div class="reasons" id="yesReasons"></div>
+            <button id="placeYes" class="btn primary" disabled>Paper place YES</button>
+          </div>
+          <div class="sideBlock">
+            <div class="sideTitle">NO</div>
+            <div class="verdict" id="noVerdict">—</div>
+            <div class="reasons" id="noReasons"></div>
+            <button id="placeNo" class="btn primary" disabled>Paper place NO</button>
+          </div>
+        </div>
+        <div class="placeholder" id="aiPlaceholder">
+          AI probability + confidence will appear here (Stage 12).
+        </div>
+      </div>
+
+      <div class="statusLine" id="statusLine"></div>
+    </div>
+
+    <script src="popup.js"></script>
+  </body>
+</html>
+

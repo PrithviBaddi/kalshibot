@@ -1,18 +1,15 @@
-import "./globals.css";
-import type { ReactNode } from "react";
+import type { Metadata } from 'next'
+import './globals.css'
 
-export const metadata = {
-  title: "KalshiBot Dashboard (Starter)",
-  description: "Minimal dashboard for KalshiBot backend APIs",
-};
-
-export default function RootLayout({ children }: { children: ReactNode }) {
-  return (
-    <html lang="en">
-      <body>
-        <div className="container">{children}</div>
-      </body>
-    </html>
-  );
+export const metadata: Metadata = {
+  title: 'KalshiBot',
+  description: 'Prediction market trading assistant',
 }
 
+export default function RootLayout({ children }: { children: React.ReactNode }) {
+  return (
+    <html lang="en">
+      <body>{children}</body>
+    </html>
+  )
+}

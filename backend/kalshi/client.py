@@ -26,7 +26,9 @@ class KalshiClient:
 
         self._private_key = load_private_key_from_env()
         resolved = base_url or os.getenv("KALSHI_API_BASE", DEFAULT_BASE)
-        self.client = httpx.AsyncClient(base_url=resolved)
+        # Kalshi endpoints can be slow intermittently; avoid flaky "Failed to fetch" UX
+        # by using a more forgiving timeout.
+        self.client = httpx.AsyncClient(base_url=resolved, timeout=httpx.Timeout(20.0))
 
     async def aclose(self):
         await self.client.aclose()

@@ -1,0 +1,25 @@
+{
+  "manifest_version": 3,
+  "name": "KalshiBot (Paper Only)",
+  "version": "0.1.0",
+  "description": "Paper-only trading assistant for KalshiBot. Future: AI probability + confidence.",
+  "permissions": ["storage", "activeTab", "scripting"],
+  "host_permissions": ["http://127.0.0.1:8000/*", "http://localhost:8000/*"],
+  "action": {
+    "default_title": "KalshiBot",
+    "default_popup": "popup.html"
+  },
+  "options_page": "options.html",
+  "content_scripts": [
+    {
+      "matches": [
+        "*://kalshi.com/*",
+        "*://www.kalshi.com/*",
+        "*://*.kalshi.com/*"
+      ],
+      "js": ["contentScript.js"],
+      "run_at": "document_end"
+    }
+  ]
+}
+

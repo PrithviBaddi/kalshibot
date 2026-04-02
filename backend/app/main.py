@@ -200,6 +200,9 @@ if _extra:
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_cors_origins,
+    # MV3 extension IDs vary, so allow any chrome-extension origin.
+    # This is required for the extension popup to call the backend directly.
+    allow_origin_regex=r"^chrome-extension://.*$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
