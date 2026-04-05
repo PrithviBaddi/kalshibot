@@ -1,7 +1,8 @@
 'use client'
 import { useEffect, useState } from 'react'
 import Link from 'next/link'
-import { api, Rule } from '@/lib/api'
+import { api, Rule, formatApiError } from '@/lib/api'
+import { ApiErrorBanner } from '@/components/ApiErrorBanner'
 
 export default function RulesPage() {
   const [rules, setRules] = useState<Rule[]>([])
@@ -19,7 +20,7 @@ export default function RulesPage() {
     try {
       const d = await api.get<{ rules: Rule[] }>('/api/v1/rules')
       setRules(d.rules ?? [])
-    } catch(e: any) { setError(e.message) }
+    } catch (e: unknown) { setError(formatApiError(e)) }
     finally { setLoading(false) }
   }
 
@@ -31,7 +32,7 @@ export default function RulesPage() {
     try {
       await api.put(`/api/v1/rules/${ruleId}`, { ...rule, enabled: !rule.enabled })
       await load()
-    } catch(e: any) { setError(e.message) }
+    } catch (e: unknown) { setError(formatApiError(e)) }
   }
 
   async function runOnce(rule: Rule) {
@@ -48,8 +49,8 @@ export default function RulesPage() {
         id: ruleId,
         msg: `Done — ${r.trades_placed ?? 0} trade(s) placed`,
       })
-    } catch(e: any) {
-      setRunResult({ id: ruleId, msg: `Error: ${e.message}` })
+    } catch (e: unknown) {
+      setRunResult({ id: ruleId, msg: `Error: ${formatApiError(e)}` })
     }
     finally { setRunning(null) }
   }
@@ -66,11 +67,7 @@ export default function RulesPage() {
         <Link href="/rules/new" className="btn btn-primary">+ New Rule</Link>
       </div>
 
-      {error && (
-        <div style={{ background: 'var(--red-bg)', border: '1px solid rgba(255,77,106,0.3)', borderRadius: 8, padding: '12px 16px', marginBottom: 16, color: 'var(--red)', fontSize: 12 }}>
-          {error}
-        </div>
-      )}
+      {error && <ApiErrorBanner message={error} onDismiss={() => setError('')} />}
 
       {loading ? (
         <div className="empty">Loading rules...</div>

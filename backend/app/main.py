@@ -20,14 +20,19 @@ from app.scanner import dedupe_markets_by_ticker, top_opportunities
 from app.db import (
     create_rule,
     init_db,
+    insert_analysis_snapshot,
     insert_paper_order,
+    insert_paper_sell,
     insert_rule_run,
+    list_analysis_snapshots,
+    list_paper_executions_ordered,
     list_paper_orders,
     list_rule_runs,
     list_rule_runs_for_rule,
     list_rules,
     list_enabled_rules,
     get_rule,
+    total_realized_pnl_cents,
     update_rule,
 )
 from app.strategy_store import get_config, init_strategy_from_db, update_config
@@ -39,8 +44,34 @@ from app.jobs import (
     rules_scheduler_loop,
     run_all_enabled_rules_once,
 )
+from app.paper_exit import paper_exit_monitor_loop
+from app.paper_pnl import (
+    enrich_paper_order,
+    load_market_snapshots,
+    summarize_mtm_orders,
+)
+from app.analysis import build_market_analysis
+from app.claude_enrichment import enrich_analysis_with_claude
+from app.news_context import fetch_news_block, headlines_for_claude
+from app.positions import (
+    build_position_snapshot,
+    compute_sell_realized_cents,
+    exit_price_cents_for_side,
+    market_yes_mid_cents,
+    open_positions_from_state,
+    replay_ledger,
+)
+from app.exit_policy import ExitPolicy, evaluate_exit
+from app.api_auth import AuthContextMiddleware, is_auth_enabled, websocket_token_ok
+from app.feature_flags import jwt_secret, user_auth_enabled
+from app.routers import auth_api, billing_api
 
 load_dotenv()
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +85,10 @@ class StrategyUpdateRequest(BaseModel):
     max_spread: float | None = Field(default=None, ge=0, le=1)
     notes: str | None = None
     blocked_keywords: list[str] | None = None
+    auto_exit_paper: bool | None = None
+    paper_take_profit_cents: int | None = Field(default=None, ge=1, le=99)
+    paper_stop_loss_cents: int | None = Field(default=None, ge=1, le=99)
+    paper_exit_interval_seconds: int | None = Field(default=None, ge=5, le=3600)
 
 
 class OrderRiskCheckRequest(BaseModel):
@@ -131,19 +166,68 @@ class RuleRunOnceRequest(BaseModel):
     daily_loss_cents: int | None = Field(default=None, ge=0)
 
 
+class AnalysisMarketRequest(BaseModel):
+    """Stage 12A: request a probability + confidence read for one contract."""
+
+    ticker: str = Field(min_length=3, max_length=512)
+    title: str | None = Field(
+        default=None,
+        max_length=2000,
+        description="Optional human title (e.g. from the page); stored in the response for UI.",
+    )
+
+
+class PaperCloseRequest(BaseModel):
+    """Simulated sell at current mid (full or partial close)."""
+
+    ticker: str = Field(min_length=3, max_length=512)
+    side: Literal["yes", "no"]
+    count: int | None = Field(
+        default=None,
+        ge=1,
+        le=100_000,
+        description="Contracts to close; omit to close the entire open lot.",
+    )
+    exit_price_cents: int | None = Field(
+        default=None,
+        ge=1,
+        le=99,
+        description=(
+            "Optional: sell at this price for the chosen side (same convention as orders: "
+            "YES side = yes cents, NO side = no cents). If set, Kalshi is not called — "
+            "use the mark shown on Paper & P&L to avoid rate limits / missing quotes."
+        ),
+    )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    app.state.user_kalshi_clients = {}
     try:
         init_db()
         init_strategy_from_db()
-        app.state.kalshi = KalshiClient()
-        logger.info("Kalshi client initialized (base URL from env or default production)")
-        app.state.ticker_hub = TickerHub(
-            app.state.kalshi.rest_base,
-            app.state.kalshi.api_key_id,
-            app.state.kalshi.signing_private_key,
-        )
-        await app.state.ticker_hub.start()
+        if user_auth_enabled() and not jwt_secret():
+            logger.warning(
+                "KALSHIBOT_USER_AUTH is set but JWT_SECRET is empty — set JWT_SECRET or disable USER_AUTH."
+            )
+        if user_auth_enabled():
+            app.state.kalshi = None
+            app.state.ticker_hub = None
+            logger.info("KALSHIBOT_USER_AUTH: Kalshi credentials are per-user (no global REST client).")
+        else:
+            try:
+                app.state.kalshi = KalshiClient()
+                logger.info("Kalshi client initialized (base URL from env or default production)")
+                app.state.ticker_hub = TickerHub(
+                    app.state.kalshi.rest_base,
+                    app.state.kalshi.api_key_id,
+                    app.state.kalshi.signing_private_key,
+                )
+                await app.state.ticker_hub.start()
+            except ValueError as e:
+                app.state.kalshi = None
+                app.state.ticker_hub = None
+                logger.warning("Kalshi client disabled: %s", e)
 
         # Stage 9 scheduler: periodically run enabled rules (paper-only).
         interval_seconds = get_scheduler_interval_seconds()
@@ -151,11 +235,22 @@ async def lifespan(app: FastAPI):
             rules_scheduler_loop(app, interval_seconds=interval_seconds),
             name="rules-scheduler",
         )
-    except ValueError as e:
-        app.state.kalshi = None
-        app.state.ticker_hub = None
-        logger.warning("Kalshi client disabled: %s", e)
+        app.state.paper_exit_task = asyncio.create_task(
+            paper_exit_monitor_loop(app),
+            name="paper-exit-monitor",
+        )
+    except Exception:
+        logger.exception("lifespan startup failed")
+        raise
     yield
+
+    pet = getattr(app.state, "paper_exit_task", None)
+    if pet is not None:
+        pet.cancel()
+        try:
+            await pet
+        except asyncio.CancelledError:
+            pass
 
     # Stop Stage 9 scheduler.
     sched_task = getattr(app.state, "rules_scheduler_task", None)
@@ -182,8 +277,9 @@ app = FastAPI(
         "try **`mve_filter=exclude`** (Kalshi multivariate legs). Filter by topic with "
         "**`series_ticker`** (and paginate with **`cursor`** — there is no single “all at once” page).\n\n"
         "**One market snapshot:** `GET /api/v1/markets/{ticker}` paste that string (not the word `ticker`).\n\n"
-        "**Live stream:** Swagger cannot test WebSockets. Use a terminal WebSocket client "
-        "(see `wscat`) or any WS client pointed at `/api/v1/ws/ticker` while `uvicorn` is running."
+        "**Live stream:** Swagger cannot test WebSockets. Use `wscat` or any WS client at "
+        "`/api/v1/ws/ticker`. If `KALSHIBOT_API_TOKEN` is set, add `?token=` with the same value "
+        "(browsers cannot send `Authorization` on WebSocket)."
     ),
     version="0.3.0",
     lifespan=lifespan,
@@ -208,6 +304,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Optional Bearer token (KALSHIBOT_API_TOKEN). Added after CORS so preflight still works.
+app.add_middleware(AuthContextMiddleware)
+
+app.include_router(auth_api.router)
+app.include_router(billing_api.router)
+
 
 @app.get("/health")
 async def health():
@@ -218,10 +320,43 @@ async def health():
 @app.get("/api/v1/status")
 async def api_status(request: Request):
     """Readiness: whether Kalshi credentials loaded and balance is reachable."""
+    auth_required = is_auth_enabled()
+    if user_auth_enabled():
+        from app.kalshi_runtime import get_kalshi_for_user
+
+        uid = int(getattr(request.state, "user_id", 1))
+        k = await get_kalshi_for_user(request.app.state, uid)
+        if k is None:
+            return {
+                "kalshi_configured": False,
+                "auth_required": auth_required,
+                "user_auth": True,
+                "message": "Add Kalshi API keys under POST /api/v1/auth/kalshi-credentials (or legacy env keys if USER_AUTH is off).",
+            }
+        try:
+            bal = await k.get_balance()
+            cents = bal.get("balance", 0)
+            return {
+                "kalshi_configured": True,
+                "auth_required": auth_required,
+                "user_auth": True,
+                "balance_cents": cents,
+                "balance_usd": round(cents / 100, 2),
+                "balance_dollars": f"{cents / 100:.2f}",
+            }
+        except Exception as e:
+            logger.exception("Kalshi balance check failed")
+            return {
+                "kalshi_configured": True,
+                "auth_required": auth_required,
+                "user_auth": True,
+                "error": str(e),
+            }
     k = getattr(request.app.state, "kalshi", None)
     if k is None:
         return {
             "kalshi_configured": False,
+            "auth_required": auth_required,
             "message": "Set KALSHI_API_KEY_ID and private key env vars.",
         }
     try:
@@ -229,8 +364,10 @@ async def api_status(request: Request):
         cents = bal.get("balance", 0)
         out = {
             "kalshi_configured": True,
+            "auth_required": auth_required,
             "balance_cents": cents,
             "balance_usd": round(cents / 100, 2),
+            "balance_dollars": f"{cents / 100:.2f}",
         }
         hub = getattr(request.app.state, "ticker_hub", None)
         out["ticker_hub_running"] = hub.is_running()
@@ -239,6 +376,7 @@ async def api_status(request: Request):
         logger.exception("Kalshi balance check failed")
         return {
             "kalshi_configured": True,
+            "auth_required": auth_required,
             "error": str(e),
         }
 
@@ -321,6 +459,58 @@ async def get_market(
         if e.response.status_code == 404:
             raise HTTPException(status_code=404, detail="Market not found") from e
         raise
+
+
+@app.post("/api/v1/analysis/market")
+async def analyze_market_endpoint(body: AnalysisMarketRequest, k: Kalshi):
+    """
+    Stage 12A — AI-style signal shell: implied YES probability + confidence.
+
+    **Baseline (no LLM):** `model_yes_probability` equals the order-book mid; `confidence`
+    reflects liquidity (spread + volume), not clairvoyance. Stage 12B adds optional Claude;
+    Stage 12C adds optional NewsAPI headlines (`analysis.news`).
+    """
+    try:
+        data = await k.get_market(body.ticker)
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 404:
+            raise HTTPException(status_code=404, detail="Market not found") from e
+        raise
+    market = data.get("market") if isinstance(data, dict) else None
+    if not isinstance(market, dict):
+        if isinstance(data, dict) and data.get("ticker"):
+            market = data
+        else:
+            raise HTTPException(status_code=502, detail="Unexpected Kalshi response shape")
+    analysis = build_market_analysis(market, title_override=body.title)
+    title_for_news = str(analysis.get("title") or body.title or "")
+    news_block = await fetch_news_block(title_for_news)
+    analysis["news"] = news_block
+    h_claude = headlines_for_claude(news_block)
+    enriched = await enrich_analysis_with_claude(
+        analysis,
+        market=market,
+        news_headlines=h_claude or None,
+    )
+    if enriched is not None:
+        analysis = enriched
+    payload = {
+        "ok": True,
+        "analysis": analysis,
+        "claude_enriched": enriched is not None,
+        "news_fetched": bool(news_block.get("ok")),
+    }
+    try:
+        insert_analysis_snapshot(
+            ticker=str(analysis.get("ticker") or body.ticker),
+            title=str(analysis.get("title") or body.title or ""),
+            analysis=analysis,
+            claude_enriched=enriched is not None,
+            news_fetched=bool(news_block.get("ok")),
+        )
+    except Exception:
+        logger.exception("Failed to persist analysis snapshot")
+    return payload
 
 
 @app.get("/api/v1/scanner/opportunities")
@@ -479,7 +669,7 @@ async def get_strategy():
 @app.put("/api/v1/strategy")
 async def put_strategy(body: StrategyUpdateRequest):
     """Stage 5: update strategy/risk knobs (in-memory for now)."""
-    cfg = update_config(**body.model_dump())
+    cfg = update_config(**body.model_dump(exclude_none=True))
     return {"ok": True, "strategy": cfg.to_dict()}
 
 
@@ -618,18 +808,21 @@ async def place_order(body: PlaceOrderRequest, request: Request):
         }
 
     # Live mode (confirm_live must be true): call Kalshi.
-    k = getattr(request.app.state, "kalshi", None)
+    from app.kalshi_runtime import get_kalshi_for_user
+
+    uid = int(getattr(request.state, "user_id", 1))
+    if user_auth_enabled():
+        k = await get_kalshi_for_user(request.app.state, uid)
+    else:
+        k = getattr(request.app.state, "kalshi", None)
     if k is None:
         return {
             "allowed": False,
-            "reasons": ["kalshi client not configured in server lifespan"],
+            "reasons": ["kalshi client not configured for this account"],
             "paper_mode": False,
             "order_notional_cents": order_notional,
             "paper": True,
         }
-
-    # Send the order to Kalshi.
-    # This is intentionally not used unless paper_mode is OFF + confirm_live=true.
     resp = await k.place_order(body.ticker, body.side, body.count, body.price_cents)
     return {
         "allowed": True,
@@ -644,6 +837,145 @@ async def place_order(body: PlaceOrderRequest, request: Request):
 async def get_paper_orders(limit: int = Query(100, ge=1, le=500)):
     """Stage 7: view paper orders persisted in SQLite."""
     return {"orders": list_paper_orders(limit=limit)}
+
+
+@app.post("/api/v1/paper/close")
+async def paper_close_position(body: PaperCloseRequest, k: Kalshi):
+    """
+    Simulate selling (closing) paper contracts at the current YES mid-derived price for that side.
+
+    Records realized P&L in the paper ledger. Requires paper_mode.
+    """
+    cfg = get_config()
+    if not cfg.paper_mode:
+        raise HTTPException(status_code=400, detail="paper_mode is off; refusing simulated close")
+
+    executions = list_paper_executions_ordered()
+    state, _ = replay_ledger(executions)
+    st = state.get((body.ticker, body.side.lower()), {"q": 0, "cost": 0})
+    open_q = int(st.get("q") or 0)
+    if open_q <= 0:
+        raise HTTPException(status_code=400, detail="no open paper position for this ticker/side")
+
+    sell_count = int(body.count) if body.count is not None else open_q
+    if sell_count > open_q:
+        raise HTTPException(status_code=400, detail=f"only {open_q} contracts open")
+
+    if body.exit_price_cents is not None:
+        exit_px = int(body.exit_price_cents)
+    else:
+        market = await k.get_market_snapshot(body.ticker)
+        if not market:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Could not get a price quote from Kalshi. "
+                    "Turn paper mode on, or retry — or pass exit_price_cents using the mark price from the UI."
+                ),
+            )
+
+        ymid = market_yes_mid_cents(market)
+        if ymid is None:
+            raise HTTPException(status_code=502, detail="Could not compute mid for exit price")
+
+        exit_px = exit_price_cents_for_side(side=body.side, yes_mid_cents=ymid)
+    realized, _ = compute_sell_realized_cents(
+        executions,
+        ticker=body.ticker,
+        side=body.side,
+        sell_count=sell_count,
+        exit_price_cents=exit_px,
+    )
+    eid = insert_paper_sell(
+        payload={
+            "ticker": body.ticker,
+            "side": body.side,
+            "price_cents": exit_px,
+            "count": sell_count,
+            "paper_mode": True,
+            "manual_close": True,
+            "used_client_exit_price": body.exit_price_cents is not None,
+        },
+        realized_pnl_cents=realized,
+    )
+    return {
+        "ok": True,
+        "execution_id": eid,
+        "exit_price_cents": exit_px,
+        "sell_count": sell_count,
+        "realized_pnl_cents": realized,
+        "total_realized_pnl_cents": total_realized_pnl_cents(),
+    }
+
+
+@app.get("/api/v1/dashboard/paper-positions")
+async def dashboard_paper_positions(k: Kalshi):
+    """Open paper lots (from ledger) with MTM unrealized P&L + lifetime realized from sells."""
+    executions = list_paper_executions_ordered()
+    state, _ = replay_ledger(executions)
+    open_pos = open_positions_from_state(state)
+    realized = total_realized_pnl_cents()
+    if not open_pos:
+        return {
+            "open_positions": [],
+            "total_realized_pnl_cents": realized,
+            "total_unrealized_pnl_cents": 0,
+            "note": "Unrealized P&L is mark-to-market on open lots; realized P&L is from simulated sells.",
+        }
+
+    tickers = list({p.ticker for p in open_pos})
+    snapshots = await load_market_snapshots(k, tickers)
+    mdict: dict[str, dict[str, Any] | None] = {t: snapshots.get(t) for t in tickers}
+    rows = build_position_snapshot(open_pos, mdict)
+    unrealized_sum = sum(int(r["unrealized_pnl_cents"] or 0) for r in rows if r.get("quote_ok"))
+    return {
+        "open_positions": rows,
+        "total_realized_pnl_cents": realized,
+        "total_unrealized_pnl_cents": unrealized_sum,
+        "note": "Unrealized P&L is mark-to-market on open lots; realized P&L is from simulated sells.",
+    }
+
+
+@app.get("/api/v1/paper/exit-suggestions")
+async def paper_exit_suggestions(k: Kalshi):
+    """
+    Heuristic take-profit / stop-loss flags vs current mid (uses strategy thresholds).
+
+    News/Claude-driven exits are future work; this is pure price vs entry.
+    """
+    cfg = get_config()
+    executions = list_paper_executions_ordered()
+    state, _ = replay_ledger(executions)
+    open_pos = open_positions_from_state(state)
+    policy = ExitPolicy(
+        take_profit_cents_per_contract=cfg.paper_take_profit_cents,
+        stop_loss_cents_per_contract=cfg.paper_stop_loss_cents,
+    )
+    out: list[dict[str, Any]] = []
+    for pos in open_pos:
+        try:
+            data = await k.get_market(pos.ticker)
+        except httpx.HTTPStatusError:
+            continue
+        market = data.get("market") if isinstance(data, dict) else None
+        if not isinstance(market, dict):
+            market = data if isinstance(data, dict) and data.get("ticker") else None
+        if not market:
+            continue
+        ymid = market_yes_mid_cents(market)
+        if ymid is None:
+            continue
+        ev = evaluate_exit(pos, yes_mid_cents=ymid, policy=policy)
+        out.append(
+            {
+                "ticker": pos.ticker,
+                "side": pos.side,
+                "open_count": pos.open_count,
+                "avg_entry_cents": round(pos.avg_entry_cents, 2),
+                **ev,
+            }
+        )
+    return {"suggestions": out, "policy": policy.__dict__, "auto_exit_paper": cfg.auto_exit_paper}
 
 
 #
@@ -672,6 +1004,14 @@ async def dashboard_rule_runs(
     return {"rule_runs": list_rule_runs_for_rule(rule_id=rule_id, limit=limit)}
 
 
+@app.get("/api/v1/dashboard/analysis-recent")
+async def dashboard_analysis_recent(
+    limit: int = Query(30, ge=1, le=100),
+):
+    """Recent POST /api/v1/analysis/market results stored in SQLite (extension or API clients)."""
+    return {"snapshots": list_analysis_snapshots(limit=limit)}
+
+
 @app.get("/api/v1/dashboard/paper-orders")
 async def dashboard_paper_orders(
     limit: int = Query(50, ge=1, le=200),
@@ -681,6 +1021,64 @@ async def dashboard_paper_orders(
     if rule_id is not None:
         orders = [o for o in orders if int(o.get("rule_id") or -1) == rule_id]
     return {"paper_orders": orders}
+
+
+@app.get("/api/v1/dashboard/paper-pnl")
+async def dashboard_paper_pnl(
+    request: Request,
+    limit: int = Query(100, ge=1, le=500),
+):
+    """
+    Paper positions with mark-to-market unrealized P&L.
+
+    Uses Kalshi REST snapshots (mid of YES bid/ask). This is not realized profit until markets settle.
+    """
+    orders = list_paper_orders(limit=limit)
+    from app.kalshi_runtime import get_kalshi_for_user
+
+    uid = int(getattr(request.state, "user_id", 1))
+    if user_auth_enabled():
+        k = await get_kalshi_for_user(request.app.state, uid)
+    else:
+        k = getattr(request.app.state, "kalshi", None)
+    if k is None:
+        enriched = [
+            {
+                **o,
+                "mtm": {
+                    "ok": False,
+                    "error": "kalshi_not_configured",
+                    "detail": "Set Kalshi API credentials on the server to compute live marks.",
+                },
+            }
+            for o in orders
+        ]
+        summary = summarize_mtm_orders(enriched)
+        summary["order_count"] = len(orders)
+        return {
+            "kalshi_configured": False,
+            "summary": summary,
+            "orders": enriched,
+            "note": (
+                "Unrealized P&L uses mid prices (mark-to-market). "
+                "Configure Kalshi on the backend to fetch quotes."
+            ),
+        }
+
+    tickers = [str(o.get("ticker") or "") for o in orders]
+    snapshots = await load_market_snapshots(k, tickers)
+    enriched = [enrich_paper_order(o, snapshots.get(str(o.get("ticker") or ""))) for o in orders]
+    summary = summarize_mtm_orders(enriched)
+    summary["order_count"] = len(orders)
+    return {
+        "kalshi_configured": True,
+        "summary": summary,
+        "orders": enriched,
+        "note": (
+            "Unrealized P&L uses mid prices (mark-to-market). "
+            "Realized profit/loss applies after settlement."
+        ),
+    }
 
 
 @app.get("/api/v1/dashboard/jobs")
@@ -710,8 +1108,11 @@ async def run_all_enabled_once_endpoint(
     request: Request, daily_loss_cents: int | None = Query(None, ge=0)
 ):
     """Stage 9: manual trigger to run all enabled rules once."""
+    uid = int(getattr(request.state, "user_id", 1))
     results = await run_all_enabled_rules_once(
-        app_state=request.app.state, daily_loss_cents=daily_loss_cents
+        app_state=request.app.state,
+        daily_loss_cents=daily_loss_cents,
+        only_user_id=uid if user_auth_enabled() else None,
     )
     return {"results": results}
 
@@ -940,7 +1341,13 @@ async def run_rule_once_endpoint(
 
     This does not place real orders. It only creates paper orders via SQLite.
     """
-    k = getattr(request.app.state, "kalshi", None)
+    from app.kalshi_runtime import get_kalshi_for_user
+
+    uid = int(getattr(request.state, "user_id", 1))
+    if user_auth_enabled():
+        k = await get_kalshi_for_user(request.app.state, uid)
+    else:
+        k = getattr(request.app.state, "kalshi", None)
     if k is None:
         raise HTTPException(status_code=503, detail="Kalshi not configured")
 
@@ -957,7 +1364,13 @@ async def ticker_downstream(websocket: WebSocket):
     """
     Browser/client WebSocket: forwards Kalshi global `ticker` channel messages as JSON text.
     Do not inject HTTP Request here — use `websocket.app.state` only (HTTP Request breaks the handshake).
+
+    When KALSHIBOT_API_TOKEN is set, pass the same value as query param: ?token=...
+    (Browsers cannot set Authorization on WebSocket.)
     """
+    if not websocket_token_ok(websocket):
+        await websocket.close(code=1008, reason="Unauthorized")
+        return
     hub = getattr(websocket.app.state, "ticker_hub", None)
     if hub is None:
         await websocket.close(code=4000, reason="Kalshi not configured")

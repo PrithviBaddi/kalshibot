@@ -1,7 +1,9 @@
 'use client'
 import { useState } from 'react'
 import Link from 'next/link'
-import { api, Market, MarketsResponse } from '@/lib/api'
+import { api, Market, MarketsResponse, formatApiError } from '@/lib/api'
+import { ApiErrorBanner } from '@/components/ApiErrorBanner'
+import { KalshiConnectionHint } from '@/components/KalshiConnectionHint'
 
 export default function MarketsPage() {
   const [markets, setMarkets] = useState<Market[]>([])
@@ -27,7 +29,7 @@ export default function MarketsPage() {
       }
       setNextCursor(d.cursor)
       setLoaded(true)
-    } catch(e: any) { setError(e.message) }
+    } catch (e: unknown) { setError(formatApiError(e)) }
     finally { setLoading(false) }
   }
 
@@ -39,6 +41,8 @@ export default function MarketsPage() {
           Browse all open markets on Kalshi. Combo/parlay markets filtered out by default.
         </p>
       </div>
+
+      <KalshiConnectionHint />
 
       {/* Filters */}
       <div className="card" style={{ marginBottom: 20 }}>
@@ -61,11 +65,7 @@ export default function MarketsPage() {
         </div>
       </div>
 
-      {error && (
-        <div style={{ background: 'var(--red-bg)', border: '1px solid rgba(255,77,106,0.3)', borderRadius: 8, padding: '12px 16px', marginBottom: 16, color: 'var(--red)', fontSize: 12 }}>
-          {error}
-        </div>
-      )}
+      {error && <ApiErrorBanner message={error} onDismiss={() => setError('')} />}
 
       {markets.length > 0 && (
         <div className="card" style={{ padding: 0, marginBottom: 16 }}>
@@ -123,11 +123,17 @@ export default function MarketsPage() {
       )}
 
       {loaded && markets.length === 0 && (
-        <div className="empty">No markets found. Try a different series ticker or click Load Markets.</div>
+        <div className="empty">
+          No rows in this page. Check the series ticker spelling (use <Link href="/scanner" style={{ color: 'var(--accent)' }}>Scanner</Link> to discover series), or tap <strong>Load more</strong> if you used pagination.
+        </div>
       )}
 
       {!loaded && (
-        <div className="empty">Click Load Markets to browse open markets.</div>
+        <div className="empty">
+          <strong>Step 1:</strong> Optionally enter a Kalshi <code style={{ fontSize: 11 }}>series_ticker</code> to narrow results.
+          <br />
+          <strong>Step 2:</strong> Click <strong>Load Markets</strong> to fetch open contracts from the API.
+        </div>
       )}
     </div>
   )

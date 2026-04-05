@@ -1,6 +1,9 @@
 'use client'
 import { useEffect, useState } from 'react'
-import { api, Opportunity, Series } from '@/lib/api'
+import Link from 'next/link'
+import { api, Opportunity, formatApiError } from '@/lib/api'
+import { ApiErrorBanner } from '@/components/ApiErrorBanner'
+import { KalshiConnectionHint } from '@/components/KalshiConnectionHint'
 
 const CATEGORIES = ['Politics', 'Economics', 'Financials', 'Climate', 'Tech', 'Science', 'Culture']
 
@@ -29,7 +32,7 @@ export default function ScannerPage() {
       )
       setOpportunities(d.opportunities ?? [])
       setScannedCount(d.scanned_count ?? 0)
-    } catch (e: any) { setError(e.message) }
+    } catch (e: unknown) { setError(formatApiError(e)) }
     finally { setScanning(false) }
   }
 
@@ -41,7 +44,7 @@ export default function ScannerPage() {
         count: 1,
       })
       setRiskResult({ ticker: opp.ticker, ...r })
-    } catch(e: any) { setError(e.message) }
+    } catch (e: unknown) { setError(formatApiError(e)) }
   }
 
   const spread2color = (s: number) => s < 0.05 ? 'var(--accent)' : s < 0.15 ? 'var(--amber)' : 'var(--red)'
@@ -55,6 +58,8 @@ export default function ScannerPage() {
           Find the most liquid, efficiently-priced non-sports markets across Kalshi.
         </p>
       </div>
+
+      <KalshiConnectionHint />
 
       {/* Filters */}
       <div className="card" style={{ marginBottom: 20 }}>
@@ -98,11 +103,7 @@ export default function ScannerPage() {
         </div>
       </div>
 
-      {error && (
-        <div style={{ background: 'var(--red-bg)', border: '1px solid rgba(255,77,106,0.3)', borderRadius: 8, padding: '12px 16px', marginBottom: 16, color: 'var(--red)', fontSize: 12 }}>
-          {error}
-        </div>
-      )}
+      {error && <ApiErrorBanner message={error} onDismiss={() => setError('')} />}
 
       {riskResult && (
         <div style={{
@@ -138,7 +139,7 @@ export default function ScannerPage() {
                 <th>Price gap</th>
                 <th>Volume</th>
                 <th>Score</th>
-                <th></th>
+                <th>Actions</th>
               </tr>
             </thead>
             <tbody>
@@ -167,9 +168,16 @@ export default function ScannerPage() {
                       <span style={{ fontSize: 11, color: 'var(--text2)' }}>{opp.score.toFixed(1)}</span>
                     </div>
                   </td>
-                  <td>
+                  <td style={{ whiteSpace: 'nowrap' }}>
+                    <Link
+                      href={`/markets/${encodeURIComponent(opp.ticker)}`}
+                      className="btn btn-ghost btn-sm"
+                      style={{ display: 'inline-block', marginRight: 6 }}
+                    >
+                      Analyze
+                    </Link>
                     <button className="btn btn-ghost btn-sm" onClick={() => riskCheck(opp)}>
-                      Risk check
+                      Risk
                     </button>
                   </td>
                 </tr>
@@ -180,9 +188,15 @@ export default function ScannerPage() {
       ) : (
         !scanning && scannedCount === 0 && (
           <div className="empty">
-            Choose a category and click Scan Now to find opportunities.
+            <strong>Get started:</strong> pick a category, adjust filters if you want, then <strong>Scan Now</strong>. Results rank markets by liquidity and tight spreads.
           </div>
         )
+      )}
+
+      {!scanning && scannedCount > 0 && opportunities.length === 0 && (
+        <div className="empty">
+          No markets matched your filters for this category. Try raising <strong>Top N</strong>, increasing max spread, or lowering min volume.
+        </div>
       )}
 
       {scanning && (

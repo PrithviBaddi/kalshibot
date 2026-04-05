@@ -23,6 +23,11 @@ def load_private_key_from_env():
     return serialization.load_pem_private_key(data, password=None, backend=default_backend())
 
 
+def load_private_key_from_pem_bytes(data: bytes):
+    """Load RSA private key from PEM bytes (per-user credentials)."""
+    return serialization.load_pem_private_key(data, password=None, backend=default_backend())
+
+
 def sign_pss_text(private_key, timestamp: str, method: str, path: str) -> str:
     path_without_query = path.split("?")[0]
     message = f"{timestamp}{method}{path_without_query}".encode("utf-8")

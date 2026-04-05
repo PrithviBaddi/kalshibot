@@ -1,8 +1,15 @@
 const state = {
   apiBase: 'http://127.0.0.1:8000',
+  apiToken: '',
   ticker: null,
   strategy: null,
   optionCandidates: [],
+}
+
+function authHeaders() {
+  const t = state.apiToken && String(state.apiToken).trim()
+  if (!t) return {}
+  return { Authorization: `Bearer ${t}` }
 }
 
 function isLikelyContractTicker(t) {
@@ -70,7 +77,10 @@ function midCentsFromYesBidAsk(m) {
 }
 
 async function apiGet(path) {
-  const res = await fetch(`${state.apiBase}${path}`, { cache: 'no-store' })
+  const res = await fetch(`${state.apiBase}${path}`, {
+    cache: 'no-store',
+    headers: { ...authHeaders() },
+  })
   if (!res.ok) throw new Error(`${res.status}: ${await res.text().catch(() => res.statusText)}`)
   return res.json()
 }
@@ -78,7 +88,7 @@ async function apiGet(path) {
 async function apiPost(path, body) {
   const res = await fetch(`${state.apiBase}${path}`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
     body: JSON.stringify(body),
   })
   if (!res.ok) throw new Error(`${res.status}: ${await res.text().catch(() => res.statusText)}`)
@@ -102,6 +112,123 @@ function renderBotStatus(strategy) {
     return
   }
   el('botStatus').textContent = strategy.paper_mode ? 'Paper mode ON' : 'LIVE mode ON (extension is paper-only)'
+}
+
+function setAnalysisIdle(message) {
+  const loading = el('analysisLoading')
+  const body = el('analysisBody')
+  const err = el('analysisError')
+  if (loading) {
+    loading.style.display = 'block'
+    loading.textContent = message || '—'
+  }
+  if (body) body.style.display = 'none'
+  if (err) {
+    err.style.display = 'none'
+    err.textContent = ''
+  }
+}
+
+function renderAnalysis(resp) {
+  const a = resp && resp.analysis
+  const loading = el('analysisLoading')
+  const body = el('analysisBody')
+  const err = el('analysisError')
+  if (!loading || !body) return
+  if (!a) {
+    setAnalysisIdle('No analysis in response.')
+    return
+  }
+  loading.style.display = 'none'
+  if (err) {
+    err.style.display = 'none'
+    err.textContent = ''
+  }
+  body.style.display = 'block'
+
+  const pct = (x) =>
+    typeof x === 'number' && Number.isFinite(x) ? `${(x * 100).toFixed(1)}%` : '—'
+  el('aiModelYes').textContent = pct(a.model_yes_probability)
+  el('aiMarketYes').textContent = pct(a.implied_yes_probability)
+
+  const edge = a.edge_vs_market_yes
+  const edgeEl = el('aiEdge')
+  if (typeof edge === 'number' && Number.isFinite(edge)) {
+    const pp = edge * 100
+    edgeEl.textContent = `${pp >= 0 ? '+' : ''}${pp.toFixed(1)} pp`
+    edgeEl.style.color = pp > 0 ? 'var(--accent)' : pp < 0 ? 'var(--red)' : 'var(--text)'
+  } else {
+    edgeEl.textContent = '—'
+    edgeEl.style.color = 'var(--accent)'
+  }
+
+  const conf = a.confidence
+  const lab = a.confidence_label || ''
+  el('aiConfidence').textContent =
+    typeof conf === 'number' && Number.isFinite(conf)
+      ? `${(conf * 100).toFixed(0)}%${lab ? ` · ${lab}` : ''}`
+      : '—'
+
+  el('aiRationale').textContent = String(a.rationale || '').slice(0, 280)
+
+  const newsEl = el('aiNewsHeadlines')
+  const n = a.news
+  if (newsEl) {
+    if (n && n.ok === true && Array.isArray(n.headlines) && n.headlines.length) {
+      newsEl.style.display = 'block'
+      const rows = n.headlines
+        .slice(0, 5)
+        .map((h) => {
+          const t = String(h?.title || '').slice(0, 140)
+          const s = String(h?.source || '').trim()
+          const src = s ? `<span class="newsSrc">${s}</span> ` : ''
+          return `<div class="newsLine">${src}${t}</div>`
+        })
+        .join('')
+      newsEl.innerHTML = `<div class="newsLabel">Recent headlines</div>${rows}`
+    } else {
+      newsEl.style.display = 'none'
+      newsEl.innerHTML = ''
+    }
+  }
+
+  const claude = resp.claude_enriched === true
+  const newsOk = resp.news_fetched === true
+  let src = 'Source: market mid baseline (liquidity-based confidence)'
+  if (claude && newsOk) src = 'Source: Claude + market + NewsAPI (server keys)'
+  else if (claude) src = 'Source: Claude + market (ANTHROPIC_API_KEY on server)'
+  else if (newsOk) src = 'Source: market baseline; NewsAPI headlines attached'
+  el('aiSource').textContent = src
+
+  el('aiSource').style.marginTop = '8px'
+}
+
+async function fetchAnalysis(ticker, title) {
+  const loading = el('analysisLoading')
+  const body = el('analysisBody')
+  const err = el('analysisError')
+  if (!loading) return
+  loading.style.display = 'block'
+  loading.textContent = 'Fetching market snapshot and model…'
+  if (body) body.style.display = 'none'
+  if (err) {
+    err.style.display = 'none'
+    err.textContent = ''
+  }
+  try {
+    const resp = await apiPost('/api/v1/analysis/market', {
+      ticker,
+      title: title || null,
+    })
+    renderAnalysis(resp)
+  } catch (e) {
+    loading.style.display = 'none'
+    if (body) body.style.display = 'none'
+    if (err) {
+      err.style.display = 'block'
+      err.textContent = `Analysis failed: ${String(e.message || e).slice(0, 200)}`
+    }
+  }
 }
 
 function renderVerdict(side, verdict, reasons) {
@@ -271,6 +398,8 @@ async function loadEverythingForTicker(selectorTicker, marketTitleText) {
     // If this is a multi-option series, let the user choose the option.
     showOptionsPicker(candidates, state.ticker)
 
+    void fetchAnalysis(state.ticker, mainLine)
+
     let yesVerdict = null
     let noVerdict = null
     try {
@@ -311,6 +440,7 @@ async function loadEverythingForTicker(selectorTicker, marketTitleText) {
     renderVerdict('no', null)
     el('market').textContent = marketTitleText || '—'
     el('marketHint').textContent = ''
+    setAnalysisIdle('Open a Kalshi market page…')
   }
 }
 
@@ -345,8 +475,17 @@ async function detectTickerFromActiveTab() {
 }
 
 async function init() {
-  const { apiBase } = await chrome.storage.sync.get(['apiBase'])
+  const { apiBase, apiToken } = await chrome.storage.sync.get(['apiBase', 'apiToken'])
   if (apiBase) state.apiBase = apiBase
+  if (apiToken != null && String(apiToken).trim()) state.apiToken = String(apiToken).trim()
+
+  const openOpts = el('openOptions')
+  if (openOpts && chrome?.runtime?.openOptionsPage) {
+    openOpts.onclick = (e) => {
+      e.preventDefault()
+      chrome.runtime.openOptionsPage()
+    }
+  }
 
   // Default UI state (pre-detection).
   state.ticker = null
@@ -359,6 +498,7 @@ async function init() {
   el('noVerdict').textContent = '—'
   el('yesReasons').textContent = ''
   el('noReasons').textContent = ''
+  setAnalysisIdle('Open a Kalshi market page…')
 
   // Read stored ticker first (the content script may have already run).
   try {

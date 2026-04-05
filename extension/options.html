@@ -3,26 +3,32 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>KalshiBot Extension Options</title>
+    <title>KalshiBot — Extension settings</title>
     <link rel="stylesheet" href="popup.css" />
   </head>
   <body>
-    <div class="container">
-      <h1>KalshiBot Options</h1>
-
-      <label>
-        API Base URL
-        <input id="apiBase" type="text" placeholder="http://127.0.0.1:8000" />
-      </label>
-
-      <div class="row">
-        <button id="save" class="btn primary">Save</button>
+    <div class="wrap" style="max-width: 420px; margin: 0 auto; padding: 20px">
+      <div class="header" style="margin-bottom: 16px">
+        <div class="title">Extension settings</div>
+        <div class="subtitle">Defaults work for local dev — open this only for a custom API URL or server password.</div>
       </div>
 
-      <div class="muted" id="status"></div>
+      <div class="card">
+        <div class="label">API base URL</div>
+        <input id="apiBase" type="text" placeholder="http://127.0.0.1:8000" autocomplete="off" style="width: 100%; box-sizing: border-box; margin-bottom: 12px" />
+        <div class="label">API token</div>
+        <p class="hint" style="margin-bottom: 8px">
+          Leave blank unless your deployed backend sets <code>KALSHIBOT_API_TOKEN</code> (same value as in your server env).
+        </p>
+        <input id="apiToken" type="password" placeholder="(empty = no token)" autocomplete="off" style="width: 100%; box-sizing: border-box; margin-bottom: 10px" />
+        <div style="display: flex; gap: 8px; flex-wrap: wrap">
+          <button type="button" id="save" class="btn primary">Save</button>
+          <button type="button" id="clearToken" class="btn">Clear token</button>
+        </div>
+        <div class="hint" id="status" style="margin-top: 10px"></div>
+      </div>
     </div>
 
     <script src="options.js"></script>
   </body>
 </html>
-

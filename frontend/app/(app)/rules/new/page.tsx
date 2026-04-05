@@ -1,7 +1,8 @@
 'use client'
 import { useState } from 'react'
 import { useRouter } from 'next/navigation'
-import { api } from '@/lib/api'
+import { api, formatApiError } from '@/lib/api'
+import { ApiErrorBanner } from '@/components/ApiErrorBanner'
 
 const TEMPLATES = [
   {
@@ -40,7 +41,7 @@ export default function NewRulePage() {
         config: { ...config, categories },
       })
       router.push('/rules')
-    } catch(e: any) { setError(e.message) }
+    } catch (e: unknown) { setError(formatApiError(e)) }
     finally { setSaving(false) }
   }
 
@@ -56,11 +57,7 @@ export default function NewRulePage() {
         </p>
       </div>
 
-      {error && (
-        <div style={{ background: 'var(--red-bg)', border: '1px solid rgba(255,77,106,0.3)', borderRadius: 8, padding: '12px 16px', marginBottom: 20, color: 'var(--red)', fontSize: 12 }}>
-          {error}
-        </div>
-      )}
+      {error && <ApiErrorBanner message={error} onDismiss={() => setError('')} />}
 
       {/* Rule name */}
       <div className="card" style={{ marginBottom: 16 }}>

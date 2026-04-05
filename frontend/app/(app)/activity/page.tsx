@@ -1,6 +1,8 @@
 'use client'
 import { useEffect, useMemo, useState } from 'react'
-import { api } from '@/lib/api'
+import Link from 'next/link'
+import { api, formatApiError } from '@/lib/api'
+import { ApiErrorBanner } from '@/components/ApiErrorBanner'
 
 export default function ActivityPage() {
   type RuleRunRow = {
@@ -77,8 +79,8 @@ export default function ActivityPage() {
           if (rule?.id !== undefined) map[String(rule.id)] = rule.name ?? `Rule ${rule.id}`
         }
         setRuleNameById(map)
-      } catch (e: any) {
-        setError(e?.message ?? String(e))
+      } catch (e: unknown) {
+        setError(formatApiError(e))
       } finally {
         setLoading(false)
       }
@@ -96,21 +98,7 @@ export default function ActivityPage() {
         </p>
       </div>
 
-      {error && (
-        <div
-          style={{
-            background: 'var(--red-bg)',
-            border: '1px solid rgba(255,77,106,0.3)',
-            borderRadius: 8,
-            padding: '12px 16px',
-            marginBottom: 16,
-            color: 'var(--red)',
-            fontSize: 12,
-          }}
-        >
-          {error}
-        </div>
-      )}
+      {error && <ApiErrorBanner message={error} onDismiss={() => setError('')} />}
 
       {loading ? (
         <div className="empty">Loading activity...</div>
@@ -121,7 +109,10 @@ export default function ActivityPage() {
             <div style={{ fontFamily: 'var(--font-display)', fontSize: 16, color: '#fff', marginBottom: 8 }}>
               No activity yet
             </div>
-            <div>Run a rule from the Rules page to see activity here.</div>
+            <div>
+              Run a rule from <Link href="/rules">Rules</Link> or enable the scheduler on the{' '}
+              <Link href="/dashboard">Dashboard</Link>. New runs appear here automatically.
+            </div>
           </div>
         </div>
       ) : (

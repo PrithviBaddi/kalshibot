@@ -2,14 +2,14 @@
 import Link from 'next/link'
 import { usePathname } from 'next/navigation'
 import { useEffect, useState } from 'react'
-import { api, StatusResponse, Strategy } from '@/lib/api'
+import { api, StatusResponse, Strategy, getAccessToken, hasClientApiToken, isUserAuthMode } from '@/lib/api'
 
 const NAV = [
   { href: '/dashboard', label: 'Dashboard',  icon: '◈' },
   { href: '/scanner',   label: 'Scanner',    icon: '⊹' },
   { href: '/markets',   label: 'Markets',    icon: '≋' },
   { href: '/rules',     label: 'Rules',      icon: '◎' },
-  { href: '/orders/paper', label: 'Orders',  icon: '↗' },
+  { href: '/orders/paper', label: 'Paper & P&L', icon: '↗' },
   { href: '/activity',  label: 'Activity',   icon: '≡' },
   { href: '/strategy',  label: 'Settings',   icon: '⚙' },
 ]
@@ -19,11 +19,32 @@ export default function AppLayout({ children }: { children: React.ReactNode }) {
   const [status, setStatus] = useState<StatusResponse | null>(null)
   const [strategy, setStrategy] = useState<Strategy | null>(null)
   const [stopping, setStopping] = useState(false)
+  const [hasJwt, setHasJwt] = useState(false)
 
   useEffect(() => {
-    api.get<StatusResponse>('/api/v1/status').then(setStatus).catch(() => {})
-    api.get<{ strategy: Strategy }>('/api/v1/dashboard/strategy')
-      .then(d => setStrategy(d.strategy ?? null)).catch(() => {})
+    setHasJwt(!!getAccessToken())
+  }, [path])
+
+  useEffect(() => {
+    let cancelled = false
+    ;(async () => {
+      try {
+        const st = await api.get<StatusResponse>('/api/v1/status')
+        if (cancelled) return
+        setStatus(st)
+        if (st.auth_required === true && !hasClientApiToken()) {
+          setStrategy(null)
+          return
+        }
+        const d = await api.get<{ strategy: Strategy }>('/api/v1/dashboard/strategy')
+        if (!cancelled) setStrategy(d.strategy ?? null)
+      } catch {
+        if (!cancelled) setStrategy(null)
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
   }, [])
 
   async function killSwitch() {
@@ -131,6 +152,38 @@ export default function AppLayout({ children }: { children: React.ReactNode }) {
           <div className="live-bar">
             <span className="dot dot-red pulse" />
             Live trading active — real money on the line
+          </div>
+        )}
+        {isUserAuthMode() && !hasJwt && !hasClientApiToken() && (
+          <div
+            style={{
+              background: 'var(--amber-bg)',
+              borderBottom: '1px solid rgba(245,166,35,0.35)',
+              padding: '8px 32px',
+              fontSize: 11,
+              color: 'var(--amber)',
+              lineHeight: 1.4,
+            }}
+          >
+            Multi-user mode: <Link href="/login" style={{ color: 'var(--accent)', fontWeight: 700 }}>Sign in</Link>
+            {' '}or <Link href="/register" style={{ color: 'var(--accent)' }}>create an account</Link>
+            {' '}— or set <code style={{ fontSize: 10 }}>NEXT_PUBLIC_API_TOKEN</code> for a shared admin token.
+          </div>
+        )}
+        {status?.auth_required === true && !hasClientApiToken() && !isUserAuthMode() && (
+          <div
+            style={{
+              background: 'var(--amber-bg)',
+              borderBottom: '1px solid rgba(245,166,35,0.35)',
+              padding: '8px 32px',
+              fontSize: 11,
+              color: 'var(--amber)',
+              lineHeight: 1.4,
+            }}
+          >
+            Backend expects an API token — add <code style={{ fontSize: 10 }}>NEXT_PUBLIC_API_TOKEN</code> to{' '}
+            <code style={{ fontSize: 10 }}>.env.local</code> (same value as server{' '}
+            <code style={{ fontSize: 10 }}>KALSHIBOT_API_TOKEN</code>), then restart Next.js. Skip this if you clear the server token for local dev.
           </div>
         )}
         <main style={{ flex: 1, padding: '28px 32px', maxWidth: 1200, width: '100%' }}>

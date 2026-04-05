@@ -1,7 +1,8 @@
 'use client'
 import { useEffect, useState } from 'react'
 import { useParams, useRouter } from 'next/navigation'
-import { api, Rule } from '@/lib/api'
+import { api, Rule, formatApiError } from '@/lib/api'
+import { ApiErrorBanner } from '@/components/ApiErrorBanner'
 
 export default function RuleEditPage() {
   const params = useParams()
@@ -16,7 +17,7 @@ export default function RuleEditPage() {
   useEffect(() => {
     api.get<{ rule: Rule }>(`/api/v1/rules/${ruleId}`)
       .then(d => setRule(d.rule))
-      .catch(e => setError(e.message))
+      .catch((e: unknown) => setError(formatApiError(e)))
       .finally(() => setLoading(false))
   }, [ruleId])
 
@@ -26,7 +27,7 @@ export default function RuleEditPage() {
     try {
       await api.put(`/api/v1/rules/${ruleId}`, rule)
       setSaved(true); setTimeout(() => setSaved(false), 2500)
-    } catch(e: any) { setError(e.message) }
+    } catch (e: unknown) { setError(formatApiError(e)) }
     finally { setSaving(false) }
   }
 
@@ -43,11 +44,7 @@ export default function RuleEditPage() {
         <div style={{ fontSize: 11, color: 'var(--text3)', fontFamily: 'var(--font-mono)' }}>{ruleId}</div>
       </div>
 
-      {error && (
-        <div style={{ background: 'var(--red-bg)', border: '1px solid rgba(255,77,106,0.3)', borderRadius: 8, padding: '12px 16px', marginBottom: 16, color: 'var(--red)', fontSize: 12 }}>
-          {error}
-        </div>
-      )}
+      {error && <ApiErrorBanner message={error} onDismiss={() => setError('')} />}
 
       <div className="card" style={{ marginBottom: 16 }}>
         <div style={{ fontSize: 11, color: 'var(--text3)', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.1em', marginBottom: 10 }}>Name</div>

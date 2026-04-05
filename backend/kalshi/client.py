@@ -1,11 +1,11 @@
 import os
 import time
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 import httpx
 from dotenv import load_dotenv
 
-from kalshi.signing import load_private_key_from_env, sign_pss_text
+from kalshi.signing import load_private_key_from_env, load_private_key_from_pem_bytes, sign_pss_text
 
 load_dotenv()
 
@@ -19,12 +19,22 @@ class KalshiClient:
     Create keys in Kalshi: Account & security → API Keys.
     """
 
-    def __init__(self, base_url: str | None = None):
-        self.api_key_id = os.getenv("KALSHI_API_KEY_ID")
+    def __init__(
+        self,
+        base_url: str | None = None,
+        *,
+        api_key_id: str | None = None,
+        private_key_pem: str | None = None,
+    ):
+        self.api_key_id = (api_key_id or os.getenv("KALSHI_API_KEY_ID") or "").strip()
         if not self.api_key_id:
             raise ValueError("Set KALSHI_API_KEY_ID (UUID from Kalshi API Keys page)")
 
-        self._private_key = load_private_key_from_env()
+        if private_key_pem:
+            pem = private_key_pem.strip().encode("utf-8")
+            self._private_key = load_private_key_from_pem_bytes(pem)
+        else:
+            self._private_key = load_private_key_from_env()
         resolved = base_url or os.getenv("KALSHI_API_BASE", DEFAULT_BASE)
         # Kalshi endpoints can be slow intermittently; avoid flaky "Failed to fetch" UX
         # by using a more forgiving timeout.
@@ -75,9 +85,12 @@ class KalshiClient:
         event_ticker=None,
         mve_filter=None,
         tickers=None,
+        status: str | None = "open",
     ):
         """GET /markets — see Kalshi docs for mve_filter, series_ticker, event_ticker."""
-        params = {"limit": limit, "status": "open"}
+        params = {"limit": limit}
+        if status is not None:
+            params["status"] = status
         if cursor:
             params["cursor"] = cursor
         if series_ticker:
@@ -92,11 +105,58 @@ class KalshiClient:
         resp.raise_for_status()
         return resp.json()
 
+    @staticmethod
+    def _coerce_market_payload(data: object) -> dict | None:
+        if not isinstance(data, dict):
+            return None
+        m = data.get("market")
+        if isinstance(m, dict):
+            return m
+        if data.get("ticker"):
+            return data
+        return None
+
     async def get_market(self, ticker: str):
         """Single market snapshot (REST); useful to compare with WebSocket ticker."""
-        resp = await self._request("GET", f"/markets/{ticker}")
+        seg = quote(str(ticker), safe="-_.~")
+        resp = await self._request("GET", f"/markets/{seg}")
         resp.raise_for_status()
         return resp.json()
+
+    async def get_market_snapshot(self, ticker: str) -> dict | None:
+        """
+        Resolve one market dict for pricing (yes bid/ask). More forgiving than get_market alone:
+        uses path encoding, falls back to GET /markets?tickers= when the single-market path fails
+        (404, rate limit, etc.).
+        """
+        t = str(ticker)
+        seg = quote(t, safe="-_.~")
+        try:
+            resp = await self._request("GET", f"/markets/{seg}")
+            resp.raise_for_status()
+            m = self._coerce_market_payload(resp.json())
+            if m:
+                return m
+        except httpx.HTTPStatusError as e:
+            # Retry via list endpoint on missing market or rate limit — avoids hard failures.
+            if e.response.status_code not in (404, 429):
+                raise
+        except httpx.HTTPError:
+            return None
+
+        for st in ("open", None):
+            try:
+                data = await self.get_markets(limit=100, tickers=t, status=st)
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code == 429:
+                    return None
+                continue
+            except httpx.HTTPError:
+                continue
+            for m in data.get("markets") or []:
+                if isinstance(m, dict) and m.get("ticker") == t:
+                    return m
+        return None
 
     async def get_series_list(
         self,

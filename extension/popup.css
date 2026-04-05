@@ -14,7 +14,7 @@ body {
   color: var(--text);
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
   font-size: 12px;
-  width: 360px;
+  width: 380px;
 }
 
 .wrap { padding: 12px; }
@@ -84,12 +84,40 @@ select {
 }
 
 .statusLine { color: var(--text2); line-height: 1.35; }
-.placeholder {
-  margin-top: 12px;
-  color: var(--text2);
-  background: rgba(0,229,160,0.05);
-  border: 1px solid rgba(0,229,160,0.15);
-  padding: 10px;
-  border-radius: 8px;
+.analysisRow {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 6px;
+  line-height: 1.35;
 }
+.analysisKey { color: var(--text2); }
+.analysisVal { font-weight: 800; color: var(--accent); text-align: right; }
+.rationale {
+  margin-top: 10px;
+  color: var(--text);
+  line-height: 1.4;
+  font-size: 11px;
+  max-height: 72px;
+  overflow: hidden;
+}
+.analysisErr {
+  margin-top: 6px;
+  color: var(--red);
+  line-height: 1.35;
+  font-size: 11px;
+}
+
+.newsHeadlines {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+  font-size: 10px;
+  line-height: 1.35;
+  max-height: 100px;
+  overflow: auto;
+}
+.newsLabel { color: var(--text2); font-weight: 800; margin-bottom: 4px; }
+.newsLine { margin-top: 4px; color: var(--text); }
+.newsSrc { color: var(--accent); margin-right: 4px; }
 

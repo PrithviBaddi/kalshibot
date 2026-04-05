@@ -31,6 +31,34 @@
         <div class="value" id="botStatus">Loading…</div>
       </div>
 
+      <div class="card" id="analysisCard">
+        <div class="label">Analysis</div>
+        <div class="hint" style="margin-top: 0; margin-bottom: 8px">Live Kalshi quote + optional Claude</div>
+        <div id="analysisLoading" class="hint">—</div>
+        <div id="analysisBody" style="display: none">
+          <div class="analysisRow">
+            <span class="analysisKey">Model P(YES)</span>
+            <span class="analysisVal" id="aiModelYes">—</span>
+          </div>
+          <div class="analysisRow">
+            <span class="analysisKey">Market mid</span>
+            <span class="analysisVal" id="aiMarketYes">—</span>
+          </div>
+          <div class="analysisRow">
+            <span class="analysisKey">Edge vs market</span>
+            <span class="analysisVal" id="aiEdge">—</span>
+          </div>
+          <div class="analysisRow">
+            <span class="analysisKey">Confidence</span>
+            <span class="analysisVal" id="aiConfidence">—</span>
+          </div>
+          <div class="rationale" id="aiRationale"></div>
+          <div id="aiNewsHeadlines" class="newsHeadlines" style="display: none"></div>
+          <div class="hint" id="aiSource"></div>
+        </div>
+        <div id="analysisError" class="analysisErr" style="display: none"></div>
+      </div>
+
       <div class="card">
         <div class="label">Risk verdict (paper)</div>
         <div class="grid">
@@ -47,9 +75,11 @@
             <button id="placeNo" class="btn primary" disabled>Paper place NO</button>
           </div>
         </div>
-        <div class="placeholder" id="aiPlaceholder">
-          AI probability + confidence will appear here (Stage 12).
-        </div>
+      </div>
+
+      <div class="hint" style="text-align: center; margin-top: 10px; font-size: 10px">
+        <span id="openOptions" style="color: var(--text2); cursor: pointer; text-decoration: underline">Settings</span>
+        <span style="color: var(--text3)"> · only if you change API URL or use a server password</span>
       </div>
 
       <div class="statusLine" id="statusLine"></div>
