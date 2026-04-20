@@ -14,6 +14,9 @@ This file is the **single source of truth** for what exists, what’s next, and 
 | **Addenda** | Work that shipped **outside** the original stage names (analysis, optional API lock, etc.). |
 | **Path to v1.0** | **Ordered checklist** — work through top to bottom; you can tick items off as you go. |
 
+**Step-by-step launch:** [`STEP_BY_STEP_TO_PRODUCTION.md`](STEP_BY_STEP_TO_PRODUCTION.md) (repo root) — ordered checklist through deploy.  
+**Product shape (Free = daily pick only, Pro = full bot):** [`docs/PRODUCT_MODEL.md`](docs/PRODUCT_MODEL.md).
+
 ---
 
 ## Stages 1–9 (foundation) — complete

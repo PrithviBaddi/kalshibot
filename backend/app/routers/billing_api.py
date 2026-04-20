@@ -58,6 +58,37 @@ async def create_checkout_session(request: Request) -> dict[str, Any]:
     return {"url": session["url"]}
 
 
+@router.post("/portal-session")
+async def billing_portal(request: Request) -> dict[str, Any]:
+    """Stripe Customer Portal — manage card, cancel subscription, invoices."""
+    if not user_auth_enabled():
+        raise HTTPException(status_code=503, detail="Billing requires KALSHIBOT_USER_AUTH=1.")
+    if not _stripe_enabled():
+        raise HTTPException(status_code=503, detail="Stripe is not configured (STRIPE_SECRET_KEY).")
+
+    uid = int(getattr(request.state, "user_id", 0))
+    if uid <= 0:
+        raise HTTPException(status_code=401, detail="Not authenticated.")
+
+    user = get_user_by_id(uid)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found.")
+    cust = user.get("stripe_customer_id")
+    if not cust:
+        raise HTTPException(
+            status_code=400,
+            detail="No Stripe customer yet. Use Checkout to subscribe first.",
+        )
+
+    stripe.api_key = os.environ["STRIPE_SECRET_KEY"]
+    base = os.getenv("PUBLIC_APP_URL", "http://localhost:3000").rstrip("/")
+    session = stripe.billing_portal.Session.create(
+        customer=cust,
+        return_url=f"{base}/strategy",
+    )
+    return {"url": session["url"]}
+
+
 @router.post("/webhook")
 async def stripe_webhook(request: Request) -> dict[str, str]:
     if not _stripe_enabled():

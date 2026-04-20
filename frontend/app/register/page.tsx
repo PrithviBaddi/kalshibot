@@ -2,7 +2,7 @@
 import { useState } from 'react'
 import Link from 'next/link'
 import { useRouter } from 'next/navigation'
-import { api, formatApiError, setAccessToken } from '@/lib/api'
+import { api, AuthTokenResponse, formatApiError, isUserAuthMode, setAccessToken, userIsPro } from '@/lib/api'
 
 export default function RegisterPage() {
   const router = useRouter()
@@ -16,9 +16,11 @@ export default function RegisterPage() {
     setLoading(true)
     setError('')
     try {
-      const r = await api.post<{ access_token: string }>('/api/v1/auth/register', { email, password })
+      const r = await api.post<AuthTokenResponse>('/api/v1/auth/register', { email, password })
       setAccessToken(r.access_token)
-      router.push('/dashboard')
+      if (!isUserAuthMode()) router.push('/dashboard')
+      else if (userIsPro(r.user)) router.push('/dashboard')
+      else router.push('/daily')
       router.refresh()
     } catch (err: unknown) {
       setError(formatApiError(err))
@@ -32,7 +34,7 @@ export default function RegisterPage() {
       <div className="card fade-in" style={{ width: '100%', maxWidth: 400 }}>
         <h1 style={{ fontSize: 22, marginBottom: 8 }}>Create account</h1>
         <p style={{ fontSize: 12, color: 'var(--text2)', marginBottom: 24 }}>
-          Password must be at least 8 characters. After signup, add your Kalshi API keys in Settings.
+          Password must be at least 8 characters. Free accounts get the daily pick; Pro unlocks the full app and Kalshi.
         </p>
         <form onSubmit={submit}>
           {error && (

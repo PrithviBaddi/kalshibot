@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from typing import Any
 
 from kalshi.client import KalshiClient
 
+logger = logging.getLogger(__name__)
+
 from app.db import load_user_kalshi_credentials
 from app.feature_flags import user_auth_enabled
+from kalshi.signing import private_key_pem_fingerprint_hint
 
 
 def invalidate_user_kalshi_cache(app_state: Any, user_id: int) -> None:
@@ -40,7 +44,20 @@ async def get_kalshi_for_user(app_state: Any, user_id: int) -> KalshiClient | No
     base = os.getenv("KALSHI_API_BASE")
     try:
         client = KalshiClient(base_url=base, api_key_id=api_key_id, private_key_pem=pem)
-    except ValueError:
+    except ValueError as e:
+        logger.warning(
+            "Kalshi client init failed for user_id=%s pem=%s: %s",
+            user_id,
+            private_key_pem_fingerprint_hint(pem),
+            e,
+        )
+        return None
+    except Exception as e:
+        logger.exception(
+            "Kalshi client init failed for user_id=%s pem=%s",
+            user_id,
+            private_key_pem_fingerprint_hint(pem),
+        )
         return None
     cache[user_id] = client
     return client

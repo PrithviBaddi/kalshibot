@@ -57,10 +57,58 @@ async function req<T>(method: string, path: string, body?: unknown): Promise<T> 
   return res.json()
 }
 
+/** Admin/script routes (e.g. daily pick generation) expect `KALSHIBOT_API_TOKEN`, not a user JWT. */
+async function adminReq<T>(method: string, path: string, body?: unknown): Promise<T> {
+  const token = API_TOKEN
+  if (!token) {
+    throw new Error('Set NEXT_PUBLIC_API_TOKEN in .env.local to match backend KALSHIBOT_API_TOKEN')
+  }
+  const res = await fetch(`${BASE}${path}`, {
+    method,
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${token}`,
+    },
+    body: body ? JSON.stringify(body) : undefined,
+    cache: 'no-store',
+  })
+  if (!res.ok) {
+    const txt = await res.text().catch(() => res.statusText)
+    throw new Error(`${res.status}: ${txt}`)
+  }
+  return res.json()
+}
+
 export const api = {
   get: <T>(path: string) => req<T>('GET', path),
   post: <T>(path: string, body?: unknown) => req<T>('POST', path, body),
   put: <T>(path: string, body?: unknown) => req<T>('PUT', path, body),
+}
+
+export const apiAdmin = {
+  post: <T>(path: string, body?: unknown) => adminReq<T>('POST', path, body),
+}
+
+/** JWT login/register payload */
+export interface AuthUser {
+  id: number
+  email: string
+  plan?: string
+  subscription_status?: string
+  kalshi_configured?: boolean
+}
+
+export interface AuthTokenResponse {
+  access_token: string
+  token_type?: string
+  user: AuthUser
+}
+
+export function userIsPro(u: AuthUser | null | undefined): boolean {
+  if (!u) return false
+  const p = u.plan ?? 'free'
+  const s = u.subscription_status ?? 'none'
+  return p === 'pro' && (s === 'active' || s === 'trialing')
 }
 
 /** Best-effort parse of FastAPI `{"detail": "..."}` and browser network errors */
@@ -88,7 +136,12 @@ export function formatApiError(err: unknown): string {
     const d = j.detail
     if (typeof d === 'string') {
       let out = `${code}: ${d}`
-      if (code === '401') out += ' (Check API token if your backend requires one.)'
+      if (code === '401' && !isUserAuthMode()) {
+        out += ' (Check API token if your backend requires one.)'
+      }
+      if (code === '402' && isUserAuthMode()) {
+        out += ' Upgrade on the Pricing page if you need Pro.'
+      }
       return out
     }
     if (Array.isArray(d) && d[0] && typeof d[0] === 'object' && d[0] !== null && 'msg' in d[0]) {
@@ -108,6 +161,9 @@ export interface StatusResponse {
   kalshi_configured: boolean
   /** True when server has KALSHIBOT_API_TOKEN set — clients must send Authorization bearer. */
   auth_required?: boolean
+  /** True when API runs with KALSHIBOT_USER_AUTH — status is per logged-in account. */
+  user_auth?: boolean
+  message?: string
   balance?: number
   balance_dollars?: string
   error?: string

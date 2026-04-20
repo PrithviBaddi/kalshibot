@@ -1,15 +1,25 @@
-"""Password hashing (bcrypt via passlib)."""
+"""Password hashing (bcrypt). Direct `bcrypt` avoids passlib + bcrypt 4.1+ breakage on Python 3.13."""
 
 from __future__ import annotations
 
-from passlib.context import CryptContext
+import hashlib
 
-_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
+import bcrypt
+
+# Bcrypt ignores bytes beyond 72; hash long UTF-8 passwords first so behavior is defined.
+def _password_bytes(plain: str) -> bytes:
+    raw = plain.encode("utf-8")
+    if len(raw) <= 72:
+        return raw
+    return hashlib.sha256(raw).digest()
 
 
 def hash_password(plain: str) -> str:
-    return _ctx.hash(plain)
+    return bcrypt.hashpw(_password_bytes(plain), bcrypt.gensalt()).decode("ascii")
 
 
 def verify_password(plain: str, hashed: str) -> bool:
-    return _ctx.verify(plain, hashed)
+    try:
+        return bcrypt.checkpw(_password_bytes(plain), hashed.encode("ascii"))
+    except ValueError:
+        return False

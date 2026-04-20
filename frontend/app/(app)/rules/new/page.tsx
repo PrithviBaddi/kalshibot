@@ -3,6 +3,7 @@ import { useState } from 'react'
 import { useRouter } from 'next/navigation'
 import { api, formatApiError } from '@/lib/api'
 import { ApiErrorBanner } from '@/components/ApiErrorBanner'
+import { KALSHI_SCAN_CATEGORIES } from '@/lib/kalshiCategories'
 
 const TEMPLATES = [
   {
@@ -13,7 +14,7 @@ const TEMPLATES = [
   },
 ]
 
-const CATEGORIES = ['Politics', 'Economics', 'Financials', 'Climate', 'Tech', 'Science', 'Culture']
+const CATEGORIES = [...KALSHI_SCAN_CATEGORIES]
 
 export default function NewRulePage() {
   const router = useRouter()

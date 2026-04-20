@@ -32,6 +32,7 @@ from app.db import (
     list_rules,
     list_enabled_rules,
     get_rule,
+    get_user_by_id,
     total_realized_pnl_cents,
     update_rule,
 )
@@ -39,6 +40,10 @@ from app.strategy_store import get_config, init_strategy_from_db, update_config
 from app.templates import validate_rule_config
 from app.ticker_hub import TickerHub
 from kalshi.client import KalshiClient
+from app.daily_pick_schedulers import (
+    daily_pick_generation_scheduler_loop,
+    daily_pick_resolution_scheduler_loop,
+)
 from app.jobs import (
     get_scheduler_interval_seconds,
     rules_scheduler_loop,
@@ -64,7 +69,10 @@ from app.positions import (
 from app.exit_policy import ExitPolicy, evaluate_exit
 from app.api_auth import AuthContextMiddleware, is_auth_enabled, websocket_token_ok
 from app.feature_flags import jwt_secret, user_auth_enabled
-from app.routers import auth_api, billing_api
+from app.free_tier_guard import FreeTierApiGuardMiddleware
+from app.jwt_tokens import decode_access_token
+from app.plan_access import is_pro_subscriber
+from app.routers import auth_api, billing_api, daily_pick_api
 
 load_dotenv()
 
@@ -239,10 +247,33 @@ async def lifespan(app: FastAPI):
             paper_exit_monitor_loop(app),
             name="paper-exit-monitor",
         )
+        app.state.daily_pick_gen_task = asyncio.create_task(
+            daily_pick_generation_scheduler_loop(app),
+            name="daily-pick-generation",
+        )
+        app.state.daily_pick_resolution_task = asyncio.create_task(
+            daily_pick_resolution_scheduler_loop(app),
+            name="daily-pick-resolution",
+        )
     except Exception:
         logger.exception("lifespan startup failed")
         raise
     yield
+
+    dpg = getattr(app.state, "daily_pick_gen_task", None)
+    if dpg is not None:
+        dpg.cancel()
+        try:
+            await dpg
+        except asyncio.CancelledError:
+            pass
+    dpr = getattr(app.state, "daily_pick_resolution_task", None)
+    if dpr is not None:
+        dpr.cancel()
+        try:
+            await dpr
+        except asyncio.CancelledError:
+            pass
 
     pet = getattr(app.state, "paper_exit_task", None)
     if pet is not None:
@@ -293,6 +324,11 @@ _extra = os.environ.get("CORS_ORIGINS", "").strip()
 if _extra:
     _cors_origins.extend([o.strip() for o in _extra.split(",") if o.strip()])
 
+# FreeTier guard must run inside Auth (after user_id is set): register Free first, Auth last.
+# Note: Starlette runs middleware in reverse registration order. We add CORS last so it runs first
+# and handles browser preflight (OPTIONS) before auth/plan checks.
+app.add_middleware(FreeTierApiGuardMiddleware)
+app.add_middleware(AuthContextMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_cors_origins,
@@ -304,11 +340,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Optional Bearer token (KALSHIBOT_API_TOKEN). Added after CORS so preflight still works.
-app.add_middleware(AuthContextMiddleware)
-
 app.include_router(auth_api.router)
 app.include_router(billing_api.router)
+app.include_router(daily_pick_api.router)
 
 
 @app.get("/health")
@@ -322,16 +356,39 @@ async def api_status(request: Request):
     """Readiness: whether Kalshi credentials loaded and balance is reachable."""
     auth_required = is_auth_enabled()
     if user_auth_enabled():
+        from app.api_auth import resolve_bearer_user_id
         from app.kalshi_runtime import get_kalshi_for_user
 
-        uid = int(getattr(request.state, "user_id", 1))
+        # /api/v1/status is auth-exempt: middleware may default user_id to 1 when JWT is missing
+        # or invalid. Resolve the account from Authorization explicitly.
+        auth = request.headers.get("authorization") or ""
+        bearer = auth[7:].strip() if auth.startswith("Bearer ") else ""
+        if not bearer:
+            return {
+                "kalshi_configured": False,
+                "auth_required": auth_required,
+                "user_auth": True,
+                "message": "Sign in so the server can load your saved Kalshi API keys.",
+            }
+        uid_resolved = resolve_bearer_user_id(bearer)
+        if uid_resolved is None:
+            return {
+                "kalshi_configured": False,
+                "auth_required": auth_required,
+                "user_auth": True,
+                "message": "Invalid or expired session. Sign in again.",
+            }
+        uid = uid_resolved
         k = await get_kalshi_for_user(request.app.state, uid)
         if k is None:
             return {
                 "kalshi_configured": False,
                 "auth_required": auth_required,
                 "user_auth": True,
-                "message": "Add Kalshi API keys under POST /api/v1/auth/kalshi-credentials (or legacy env keys if USER_AUTH is off).",
+                "message": (
+                    "No Kalshi keys for this account yet. Add them under Settings or Setup, "
+                    "or use legacy KALSHI_* env vars only when USER_AUTH is off."
+                ),
             }
         try:
             bal = await k.get_balance()
@@ -462,7 +519,7 @@ async def get_market(
 
 
 @app.post("/api/v1/analysis/market")
-async def analyze_market_endpoint(body: AnalysisMarketRequest, k: Kalshi):
+async def analyze_market_endpoint(request: Request, body: AnalysisMarketRequest, k: Kalshi):
     """
     Stage 12A — AI-style signal shell: implied YES probability + confidence.
 
@@ -470,6 +527,9 @@ async def analyze_market_endpoint(body: AnalysisMarketRequest, k: Kalshi):
     reflects liquidity (spread + volume), not clairvoyance. Stage 12B adds optional Claude;
     Stage 12C adds optional NewsAPI headlines (`analysis.news`).
     """
+    from app.plan_access import analysis_enrichment_flags
+
+    allow_claude, allow_news = analysis_enrichment_flags(request)
     try:
         data = await k.get_market(body.ticker)
     except httpx.HTTPStatusError as e:
@@ -484,21 +544,26 @@ async def analyze_market_endpoint(body: AnalysisMarketRequest, k: Kalshi):
             raise HTTPException(status_code=502, detail="Unexpected Kalshi response shape")
     analysis = build_market_analysis(market, title_override=body.title)
     title_for_news = str(analysis.get("title") or body.title or "")
-    news_block = await fetch_news_block(title_for_news)
+    if allow_news:
+        news_block = await fetch_news_block(title_for_news)
+    else:
+        news_block = {"ok": False, "skipped": True, "reason": "upgrade_for_news"}
     analysis["news"] = news_block
-    h_claude = headlines_for_claude(news_block)
-    enriched = await enrich_analysis_with_claude(
-        analysis,
-        market=market,
-        news_headlines=h_claude or None,
-    )
+    h_claude = headlines_for_claude(news_block) if allow_news else []
+    enriched = None
+    if allow_claude:
+        enriched = await enrich_analysis_with_claude(
+            analysis,
+            market=market,
+            news_headlines=h_claude or None,
+        )
     if enriched is not None:
         analysis = enriched
     payload = {
         "ok": True,
         "analysis": analysis,
         "claude_enriched": enriched is not None,
-        "news_fetched": bool(news_block.get("ok")),
+        "news_fetched": bool(allow_news and news_block.get("ok")),
     }
     try:
         insert_analysis_snapshot(
@@ -510,11 +575,18 @@ async def analyze_market_endpoint(body: AnalysisMarketRequest, k: Kalshi):
         )
     except Exception:
         logger.exception("Failed to persist analysis snapshot")
+    if user_auth_enabled():
+        uid = int(getattr(request.state, "user_id", 0))
+        if uid > 0:
+            from app.db import record_successful_analysis
+
+            record_successful_analysis(uid)
     return payload
 
 
 @app.get("/api/v1/scanner/opportunities")
 async def scanner_opportunities(
+    request: Request,
     k: Kalshi,
     top_n: int = Query(20, ge=1, le=100, description="How many ranked opportunities to return."),
     limit: int = Query(200, ge=1, le=200, description="Page size when using series_ticker + cursor."),
@@ -557,7 +629,10 @@ async def scanner_opportunities(
             detail="Use either series_ticker (one series) or category/categories — not both.",
         )
 
+    from app.plan_access import enforce_scanner_quota, record_scanner_use
+
     if series_ticker:
+        enforce_scanner_quota(request)
         data = await k.get_markets(
             limit=limit,
             cursor=cursor,
@@ -565,7 +640,7 @@ async def scanner_opportunities(
             series_ticker=series_ticker,
         )
         markets = data.get("markets", [])
-        return {
+        out = {
             "scan_mode": "series_ticker",
             "scanned_count": len(markets),
             "filters": {
@@ -587,6 +662,8 @@ async def scanner_opportunities(
                 max_spread=max_spread,
             ),
         }
+        record_scanner_use(request)
+        return out
 
     cats: list[str] = []
     if category:
@@ -611,6 +688,8 @@ async def scanner_opportunities(
             detail="cursor only applies when series_ticker is set. Category scans merge many series; use series_ticker + cursor to paginate one series.",
         )
 
+    enforce_scanner_quota(request)
+
     series_seen: dict[str, dict] = {}
     for cat in cats:
         if len(series_seen) >= max_series:
@@ -634,7 +713,7 @@ async def scanner_opportunities(
 
     markets = dedupe_markets_by_ticker(all_markets)
 
-    return {
+    out = {
         "scan_mode": "kalshi_category",
         "scanned_count": len(markets),
         "filters": {
@@ -658,6 +737,8 @@ async def scanner_opportunities(
             max_spread=max_spread,
         ),
     }
+    record_scanner_use(request)
+    return out
 
 
 @app.get("/api/v1/strategy")
@@ -667,9 +748,16 @@ async def get_strategy():
 
 
 @app.put("/api/v1/strategy")
-async def put_strategy(body: StrategyUpdateRequest):
+async def put_strategy(request: Request, body: StrategyUpdateRequest):
     """Stage 5: update strategy/risk knobs (in-memory for now)."""
-    cfg = update_config(**body.model_dump(exclude_none=True))
+    current = get_config()
+    payload = body.model_dump(exclude_none=True)
+    new_paper = payload["paper_mode"] if "paper_mode" in payload else current.paper_mode
+    if user_auth_enabled() and new_paper is False:
+        from app.plan_access import require_pro_subscriber
+
+        require_pro_subscriber(request)
+    cfg = update_config(**payload)
     return {"ok": True, "strategy": cfg.to_dict()}
 
 
@@ -778,6 +866,9 @@ async def place_order(body: PlaceOrderRequest, request: Request):
                 "order_notional_cents": order_notional,
                 "paper": True,
             }
+        from app.plan_access import require_pro_subscriber
+
+        require_pro_subscriber(request)
 
     # Paper mode: do not call Kalshi.
     if paper_mode:
@@ -1108,12 +1199,16 @@ async def run_all_enabled_once_endpoint(
     request: Request, daily_loss_cents: int | None = Query(None, ge=0)
 ):
     """Stage 9: manual trigger to run all enabled rules once."""
+    from app.plan_access import enforce_manual_job_run_quota, record_manual_job_run
+
+    enforce_manual_job_run_quota(request)
     uid = int(getattr(request.state, "user_id", 1))
     results = await run_all_enabled_rules_once(
         app_state=request.app.state,
         daily_loss_cents=daily_loss_cents,
         only_user_id=uid if user_auth_enabled() else None,
     )
+    record_manual_job_run(request)
     return {"results": results}
 
 
@@ -1342,6 +1437,9 @@ async def run_rule_once_endpoint(
     This does not place real orders. It only creates paper orders via SQLite.
     """
     from app.kalshi_runtime import get_kalshi_for_user
+    from app.plan_access import enforce_manual_job_run_quota, record_manual_job_run
+
+    enforce_manual_job_run_quota(request)
 
     uid = int(getattr(request.state, "user_id", 1))
     if user_auth_enabled():
@@ -1351,12 +1449,15 @@ async def run_rule_once_endpoint(
     if k is None:
         raise HTTPException(status_code=503, detail="Kalshi not configured")
 
-    return await run_rule_once_internal(
+    result = await run_rule_once_internal(
         rule_id=rule_id,
         daily_loss_cents=body.daily_loss_cents,
         kalshi_client=k,
         cfg=get_config(),
     )
+    if user_auth_enabled() and result.get("allowed"):
+        record_manual_job_run(request)
+    return result
 
 
 @app.websocket("/api/v1/ws/ticker")
@@ -1371,6 +1472,30 @@ async def ticker_downstream(websocket: WebSocket):
     if not websocket_token_ok(websocket):
         await websocket.close(code=1008, reason="Unauthorized")
         return
+
+    if user_auth_enabled() and jwt_secret():
+        from app.api_auth import get_api_token
+
+        expected = get_api_token()
+        q = (websocket.query_params.get("token") or "").strip()
+        auth_h = (websocket.headers.get("authorization") or "").strip()
+        bearer = auth_h[7:].strip() if auth_h.startswith("Bearer ") else ""
+        admin_ws = bool(expected and (q == expected or bearer == expected))
+        if not admin_ws:
+            raw = q or bearer
+            if raw:
+                payload = decode_access_token(raw)
+                if payload and payload.get("sub"):
+                    try:
+                        uid = int(payload["sub"])
+                    except (TypeError, ValueError):
+                        uid = 0
+                    if uid > 0:
+                        u = get_user_by_id(uid)
+                        if u and not is_pro_subscriber(u):
+                            await websocket.close(code=1008, reason="Pro subscription required for ticker stream")
+                            return
+
     hub = getattr(websocket.app.state, "ticker_hub", None)
     if hub is None:
         await websocket.close(code=4000, reason="Kalshi not configured")

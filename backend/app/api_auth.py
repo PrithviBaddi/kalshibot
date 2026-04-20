@@ -36,9 +36,19 @@ def _exempt_path(path: str, method: str) -> bool:
         return True
     if path == "/docs" or path.startswith("/docs/"):
         return True
-    if path in ("/api/v1/auth/register", "/api/v1/auth/login"):
+    if path in (
+        "/api/v1/auth/register",
+        "/api/v1/auth/login",
+        "/api/v1/auth/forgot-password",
+        "/api/v1/auth/reset-password",
+    ):
         return True
     if path == "/api/v1/billing/webhook":
+        return True
+    # Operator/cron only; enforced inside the route with the same shared token (or 503 if unset).
+    if path == "/api/v1/daily-picks/generate" and method == "POST":
+        return True
+    if path == "/api/v1/daily-picks/resolve" and method == "POST":
         return True
     return False
 
@@ -53,7 +63,7 @@ def _needs_credential_gate(path: str, method: str) -> bool:
     return False
 
 
-def _resolve_bearer_user_id(bearer: str) -> int | None:
+def resolve_bearer_user_id(bearer: str) -> int | None:
     if not bearer:
         return None
     expected = get_api_token()
@@ -85,7 +95,7 @@ class AuthContextMiddleware(BaseHTTPMiddleware):
         resolved: int | None = None
         uid = 1
         if bearer:
-            resolved = _resolve_bearer_user_id(bearer)
+            resolved = resolve_bearer_user_id(bearer)
             if resolved is not None:
                 uid = resolved
 

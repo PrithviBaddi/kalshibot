@@ -140,7 +140,73 @@ def init_db() -> None:
         con.commit()
 
         _stage12_schema_migrate(con)
+        _saas_extras_migrate(con)
         con.commit()
+
+
+def _saas_extras_migrate(con: sqlite3.Connection) -> None:
+    """Usage quotas, password reset tokens."""
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS usage_daily (
+          user_id INTEGER NOT NULL,
+          day TEXT NOT NULL,
+          kind TEXT NOT NULL,
+          count INTEGER NOT NULL DEFAULT 0,
+          PRIMARY KEY (user_id, day, kind)
+        )
+        """
+    )
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS password_reset_tokens (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          user_id INTEGER NOT NULL,
+          token_hash TEXT NOT NULL UNIQUE,
+          expires_at INTEGER NOT NULL,
+          FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+        )
+        """
+    )
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS global_daily_picks (
+          day TEXT PRIMARY KEY,
+          ticker TEXT NOT NULL,
+          title TEXT NOT NULL,
+          summary TEXT NOT NULL,
+          confidence REAL,
+          pick_json TEXT NOT NULL,
+          created_at INTEGER NOT NULL,
+          market_implied_yes REAL,
+          model_yes_probability REAL,
+          confidence_score INTEGER,
+          edge REAL,
+          recommended_action TEXT,
+          reasoning TEXT
+        )
+        """
+    )
+    gcols = _table_columns(con, "global_daily_picks")
+    if gcols and "confidence" not in gcols:
+        con.execute("ALTER TABLE global_daily_picks ADD COLUMN confidence REAL")
+    gcols = _table_columns(con, "global_daily_picks")
+    for col, typ in (
+        ("market_implied_yes", "REAL"),
+        ("model_yes_probability", "REAL"),
+        ("confidence_score", "INTEGER"),
+        ("edge", "REAL"),
+        ("recommended_action", "TEXT"),
+        ("reasoning", "TEXT"),
+        ("resolved", "INTEGER"),
+        ("resolution_correct", "INTEGER"),
+        ("resolved_at", "INTEGER"),
+        ("context_sources_used", "TEXT"),
+        ("resolution_result", "TEXT"),
+    ):
+        if gcols and col not in gcols:
+            con.execute(f"ALTER TABLE global_daily_picks ADD COLUMN {col} {typ}")
+            gcols = _table_columns(con, "global_daily_picks")
 
 
 def _table_columns(con: sqlite3.Connection, table: str) -> set[str]:
@@ -735,10 +801,11 @@ def update_user_plan(user_id: int, *, plan: str, subscription_status: str) -> No
 
 def save_user_kalshi_credentials(*, user_id: int, api_key_id: str, private_key_pem: str) -> None:
     from app.credentials_crypto import encrypt_secret
+    from kalshi.signing import normalize_private_key_pem
 
     now = int(time.time())
     blob_id = encrypt_secret(api_key_id.strip())
-    blob_pem = encrypt_secret(private_key_pem.strip())
+    blob_pem = encrypt_secret(normalize_private_key_pem(private_key_pem))
     with connect() as con:
         con.execute(
             """
@@ -779,4 +846,497 @@ def list_user_ids_with_enabled_rules() -> list[int]:
             """
         ).fetchall()
         return [int(r["user_id"]) for r in rows]
+
+
+def user_has_kalshi_credentials(user_id: int) -> bool:
+    with connect() as con:
+        row = con.execute(
+            "SELECT 1 FROM user_kalshi_credentials WHERE user_id = ? LIMIT 1",
+            (user_id,),
+        ).fetchone()
+        return row is not None
+
+
+def assert_free_tier_analysis_allowed(*, user_id: int, is_pro: bool) -> None:
+    """Raises HTTPException 402 if free tier has no remaining analyses today (UTC). Pro: no-op."""
+    from fastapi import HTTPException
+
+    if is_pro:
+        return
+    limit = int(os.getenv("FREE_TIER_ANALYSIS_PER_DAY", "25"))
+    day = _utc_day_string()
+    with connect() as con:
+        row = con.execute(
+            "SELECT count FROM usage_daily WHERE user_id = ? AND day = ? AND kind = ?",
+            (user_id, day, "analysis"),
+        ).fetchone()
+        c = int(row["count"]) if row else 0
+        if c >= limit:
+            raise HTTPException(
+                status_code=402,
+                detail=(
+                    f"Free plan allows {limit} market analyses per day (UTC). "
+                    "Upgrade to Pro for AI enrichment and higher limits."
+                ),
+            )
+
+
+def record_successful_analysis(user_id: int) -> None:
+    """Call after a completed analysis to increment daily usage (free + pro)."""
+    _bump_usage(user_id, "analysis")
+
+
+def assert_free_tier_scanner_allowed(*, user_id: int, is_pro: bool) -> None:
+    """Raises HTTP 402 when free tier exceeded daily scanner requests (UTC). Pro: no-op."""
+    from fastapi import HTTPException
+
+    if is_pro:
+        return
+    limit = int(os.getenv("FREE_TIER_SCANNER_PER_DAY", "40"))
+    day = _utc_day_string()
+    with connect() as con:
+        row = con.execute(
+            "SELECT count FROM usage_daily WHERE user_id = ? AND day = ? AND kind = ?",
+            (user_id, day, "scanner"),
+        ).fetchone()
+        c = int(row["count"]) if row else 0
+        if c >= limit:
+            raise HTTPException(
+                status_code=402,
+                detail=(
+                    f"Free plan allows {limit} scanner requests per day (UTC). "
+                    "Upgrade to Pro for unlimited scans."
+                ),
+            )
+
+
+def record_scanner_request(user_id: int) -> None:
+    _bump_usage(user_id, "scanner")
+
+
+def assert_free_tier_job_run_allowed(*, user_id: int, is_pro: bool) -> None:
+    """Manual rule/job runs — free tier daily cap (scheduler exempt)."""
+    from fastapi import HTTPException
+
+    if is_pro:
+        return
+    limit = int(os.getenv("FREE_TIER_JOB_RUNS_PER_DAY", "30"))
+    day = _utc_day_string()
+    with connect() as con:
+        row = con.execute(
+            "SELECT count FROM usage_daily WHERE user_id = ? AND day = ? AND kind = ?",
+            (user_id, day, "job_run"),
+        ).fetchone()
+        c = int(row["count"]) if row else 0
+        if c >= limit:
+            raise HTTPException(
+                status_code=402,
+                detail=(
+                    f"Free plan allows {limit} manual rule runs per day (UTC). "
+                    "Upgrade to Pro for higher limits."
+                ),
+            )
+
+
+def record_job_run_request(user_id: int) -> None:
+    _bump_usage(user_id, "job_run")
+
+
+def _bump_usage(user_id: int, kind: str) -> None:
+    day = _utc_day_string()
+    with connect() as con:
+        con.execute(
+            """
+            INSERT INTO usage_daily (user_id, day, kind, count) VALUES (?, ?, ?, 1)
+            ON CONFLICT(user_id, day, kind) DO UPDATE SET count = count + 1
+            """,
+            (user_id, day, kind),
+        )
+        con.commit()
+
+
+def _utc_day_string() -> str:
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def save_password_reset_token(*, user_id: int, token_hash: str, expires_at: int) -> None:
+    with connect() as con:
+        con.execute("DELETE FROM password_reset_tokens WHERE user_id = ?", (user_id,))
+        con.execute(
+            """
+            INSERT INTO password_reset_tokens (user_id, token_hash, expires_at)
+            VALUES (?, ?, ?)
+            """,
+            (user_id, token_hash, expires_at),
+        )
+        con.commit()
+
+
+def take_password_reset_user_id(*, token_hash: str) -> int | None:
+    """If valid and not expired, deletes row and returns user_id."""
+    now = int(time.time())
+    with connect() as con:
+        row = con.execute(
+            "SELECT user_id FROM password_reset_tokens WHERE token_hash = ? AND expires_at > ?",
+            (token_hash, now),
+        ).fetchone()
+        if not row:
+            return None
+        uid = int(row["user_id"])
+        con.execute("DELETE FROM password_reset_tokens WHERE token_hash = ?", (token_hash,))
+        con.commit()
+        return uid
+
+
+def update_user_password(user_id: int, *, password_hash: str) -> None:
+    with connect() as con:
+        con.execute(
+            "UPDATE users SET password_hash = ? WHERE id = ?",
+            (password_hash, user_id),
+        )
+        con.commit()
+
+
+def _row_bool(v: Any) -> bool | None:
+    if v is None:
+        return None
+    return bool(int(v))
+
+
+def _row_json_list(v: Any) -> list[Any] | None:
+    if v is None or v == "":
+        return None
+    try:
+        out = json.loads(str(v))
+    except (TypeError, ValueError):
+        return None
+    return out if isinstance(out, list) else None
+
+
+def get_global_daily_pick(day: str) -> dict[str, Any] | None:
+    with connect() as con:
+        row = con.execute(
+            """
+            SELECT day, ticker, title, summary, confidence, pick_json, created_at,
+                   market_implied_yes, model_yes_probability, confidence_score,
+                   edge, recommended_action, reasoning,
+                   resolved, resolution_correct, resolved_at, context_sources_used, resolution_result
+            FROM global_daily_picks WHERE day = ?
+            """,
+            (day,),
+        ).fetchone()
+        if not row:
+            return None
+        conf = row["confidence"]
+
+        def _f(name: str) -> float | None:
+            v = row[name]
+            return float(v) if v is not None else None
+
+        def _i(name: str) -> int | None:
+            v = row[name]
+            return int(v) if v is not None else None
+
+        def _s(name: str) -> str | None:
+            v = row[name]
+            return v if v is not None else None
+
+        ra = _s("recommended_action")
+        return {
+            "day": row["day"],
+            "ticker": row["ticker"],
+            "title": row["title"],
+            "summary": row["summary"],
+            "confidence": float(conf) if conf is not None else None,
+            "pick": json.loads(row["pick_json"]),
+            "created_at": int(row["created_at"]),
+            "market_implied_yes": _f("market_implied_yes"),
+            "model_yes_probability": _f("model_yes_probability"),
+            "confidence_score": _i("confidence_score"),
+            "edge": _f("edge"),
+            "recommended_action": ra,
+            "reasoning": _s("reasoning"),
+            "resolved": _row_bool(row["resolved"]),
+            "resolution_correct": _row_bool(row["resolution_correct"]),
+            "resolved_at": _i("resolved_at"),
+            "context_sources_used": _row_json_list(row["context_sources_used"]),
+            "resolution_result": _s("resolution_result"),
+        }
+
+
+def upsert_global_daily_pick(
+    *,
+    day: str,
+    ticker: str,
+    title: str,
+    summary: str,
+    confidence: float | None,
+    pick: dict[str, Any],
+    created_at: int,
+    market_implied_yes: float | None = None,
+    model_yes_probability: float | None = None,
+    confidence_score: int | None = None,
+    edge: float | None = None,
+    recommended_action: str | None = None,
+    reasoning: str | None = None,
+    context_sources_used: list[str] | None = None,
+) -> None:
+    blob = json.dumps(pick, ensure_ascii=False)
+    ctx_blob = json.dumps(context_sources_used, ensure_ascii=False) if context_sources_used is not None else None
+    with connect() as con:
+        con.execute(
+            """
+            INSERT INTO global_daily_picks (
+              day, ticker, title, summary, confidence, pick_json, created_at,
+              market_implied_yes, model_yes_probability, confidence_score,
+              edge, recommended_action, reasoning, context_sources_used
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(day) DO UPDATE SET
+              ticker = excluded.ticker,
+              title = excluded.title,
+              summary = excluded.summary,
+              confidence = excluded.confidence,
+              pick_json = excluded.pick_json,
+              created_at = excluded.created_at,
+              market_implied_yes = excluded.market_implied_yes,
+              model_yes_probability = excluded.model_yes_probability,
+              confidence_score = excluded.confidence_score,
+              edge = excluded.edge,
+              recommended_action = excluded.recommended_action,
+              reasoning = excluded.reasoning,
+              context_sources_used = excluded.context_sources_used
+            """,
+            (
+                day,
+                ticker,
+                title,
+                summary,
+                confidence,
+                blob,
+                created_at,
+                market_implied_yes,
+                model_yes_probability,
+                confidence_score,
+                edge,
+                recommended_action,
+                reasoning,
+                ctx_blob,
+            ),
+        )
+        con.commit()
+
+
+def list_global_daily_pick_history(*, limit: int = 30) -> list[dict[str, Any]]:
+    """Most recent UTC days first (by `day` string desc)."""
+    lim = max(1, min(int(limit), 200))
+    with connect() as con:
+        rows = con.execute(
+            """
+            SELECT day, ticker, title, summary, confidence, pick_json, created_at,
+                   market_implied_yes, model_yes_probability, confidence_score,
+                   edge, recommended_action, reasoning,
+                   resolved, resolution_correct, resolved_at, context_sources_used, resolution_result
+            FROM global_daily_picks
+            ORDER BY day DESC
+            LIMIT ?
+            """,
+            (lim,),
+        ).fetchall()
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        conf = row["confidence"]
+        ra = row["recommended_action"]
+        out.append(
+            {
+                "day": row["day"],
+                "ticker": row["ticker"],
+                "title": row["title"],
+                "summary": row["summary"],
+                "confidence": float(conf) if conf is not None else None,
+                "pick": json.loads(row["pick_json"]),
+                "created_at": int(row["created_at"]),
+                "market_implied_yes": float(row["market_implied_yes"]) if row["market_implied_yes"] is not None else None,
+                "model_yes_probability": float(row["model_yes_probability"]) if row["model_yes_probability"] is not None else None,
+                "confidence_score": int(row["confidence_score"]) if row["confidence_score"] is not None else None,
+                "edge": float(row["edge"]) if row["edge"] is not None else None,
+                "recommended_action": ra if ra is not None else None,
+                "reasoning": row["reasoning"] if row["reasoning"] is not None else None,
+                "resolved": _row_bool(row["resolved"]),
+                "resolution_correct": _row_bool(row["resolution_correct"]),
+                "resolved_at": int(row["resolved_at"]) if row["resolved_at"] is not None else None,
+                "context_sources_used": _row_json_list(row["context_sources_used"]),
+                "resolution_result": row["resolution_result"] if row["resolution_result"] is not None else None,
+            }
+        )
+    return out
+
+
+def list_unresolved_daily_picks() -> list[dict[str, Any]]:
+    """Rows with `resolved` NULL (pending automatic or manual resolution)."""
+    with connect() as con:
+        rows = con.execute(
+            """
+            SELECT day, ticker, recommended_action
+            FROM global_daily_picks
+            WHERE resolved IS NULL
+            ORDER BY day ASC
+            """
+        ).fetchall()
+    return [
+        {
+            "day": str(r["day"]),
+            "ticker": str(r["ticker"] or ""),
+            "recommended_action": r["recommended_action"],
+        }
+        for r in rows
+    ]
+
+
+def apply_automatic_daily_pick_resolution(
+    *,
+    day: str,
+    resolution_result: str,
+    resolution_correct: bool | None,
+    resolved_at: int,
+) -> bool:
+    """
+    Set settlement outcome from Kalshi. `resolution_correct` is NULL for PASS picks.
+    Returns True if a row was updated.
+    """
+    rc_sql: int | None
+    if resolution_correct is None:
+        rc_sql = None
+    else:
+        rc_sql = 1 if resolution_correct else 0
+    with connect() as con:
+        cur = con.execute(
+            """
+            UPDATE global_daily_picks
+            SET resolved = 1,
+                resolved_at = ?,
+                resolution_result = ?,
+                resolution_correct = ?
+            WHERE day = ? AND resolved IS NULL
+            """,
+            (resolved_at, resolution_result, rc_sql, day),
+        )
+        con.commit()
+        return cur.rowcount > 0
+
+
+def get_daily_pick_accuracy_stats() -> dict[str, Any]:
+    """Aggregate calibration stats (PASS resolved counts toward total_resolved, not accuracy)."""
+    with connect() as con:
+        rows = con.execute(
+            """
+            SELECT recommended_action, resolved, resolution_correct
+            FROM global_daily_picks
+            """
+        ).fetchall()
+
+    def norm_action(a: Any) -> str:
+        s = str(a or "PASS").upper().strip().replace(" ", "_").replace("-", "_")
+        if s in ("BUY_YES", "BUY_NO", "PASS"):
+            return s
+        return "PASS"
+
+    total_picks = len(rows)
+    resolved_rows = [r for r in rows if r["resolved"] is not None and int(r["resolved"]) == 1]
+    total_resolved = len(resolved_rows)
+
+    pass_resolved = [r for r in resolved_rows if norm_action(r["recommended_action"]) == "PASS"]
+    pass_excluded = len(pass_resolved)
+
+    scored = [
+        r
+        for r in resolved_rows
+        if norm_action(r["recommended_action"]) in ("BUY_YES", "BUY_NO")
+        and r["resolution_correct"] is not None
+    ]
+    correct = sum(1 for r in scored if int(r["resolution_correct"]) == 1)
+    incorrect = sum(1 for r in scored if int(r["resolution_correct"]) == 0)
+    denom = correct + incorrect
+    accuracy_percent = round(100.0 * correct / denom, 2) if denom > 0 else None
+
+    def breakdown_for(action: str) -> dict[str, int]:
+        sub = [r for r in scored if norm_action(r["recommended_action"]) == action]
+        c = sum(1 for r in sub if int(r["resolution_correct"]) == 1)
+        ic = sum(1 for r in sub if int(r["resolution_correct"]) == 0)
+        return {"resolved": len(sub), "correct": c, "incorrect": ic}
+
+    return {
+        "total_picks": total_picks,
+        "total_resolved": total_resolved,
+        "pass_picks_excluded": pass_excluded,
+        "non_pass_resolved_count": len(scored),
+        "correct": correct,
+        "incorrect": incorrect,
+        "accuracy_percent": accuracy_percent,
+        "by_recommended_action": {
+            "BUY_YES": breakdown_for("BUY_YES"),
+            "BUY_NO": breakdown_for("BUY_NO"),
+        },
+    }
+
+
+def resolve_global_daily_pick(
+    *,
+    day: str,
+    resolved: bool,
+    resolution_correct: bool | None,
+) -> bool:
+    """Mark resolution for a UTC day. Returns True if a row was updated."""
+    with connect() as con:
+        if not resolved:
+            cur = con.execute(
+                """
+                UPDATE global_daily_picks
+                SET resolved = NULL, resolution_correct = NULL, resolved_at = NULL, resolution_result = NULL
+                WHERE day = ?
+                """,
+                (day,),
+            )
+        else:
+            if resolution_correct is None:
+                raise ValueError("resolution_correct is required when resolved is true")
+            now = int(time.time())
+            cur = con.execute(
+                """
+                UPDATE global_daily_picks
+                SET resolved = 1, resolution_correct = ?, resolved_at = ?
+                WHERE day = ?
+                """,
+                (1 if resolution_correct else 0, now, day),
+            )
+        con.commit()
+        return cur.rowcount > 0
+
+
+def list_global_daily_picks_for_similarity(*, before_day: str, limit_rows: int = 200) -> list[dict[str, Any]]:
+    """Past picks (strictly before `before_day`) for keyword overlap / feedback context."""
+    lim = max(1, min(int(limit_rows), 500))
+    with connect() as con:
+        rows = con.execute(
+            """
+            SELECT day, title, recommended_action, resolved, resolution_correct
+            FROM global_daily_picks
+            WHERE day < ?
+            ORDER BY day DESC
+            LIMIT ?
+            """,
+            (before_day, lim),
+        ).fetchall()
+    return [
+        {
+            "day": str(r["day"]),
+            "title": str(r["title"] or ""),
+            "recommended_action": str(r["recommended_action"] or ""),
+            "resolved": _row_bool(r["resolved"]),
+            "resolution_correct": _row_bool(r["resolution_correct"]),
+        }
+        for r in rows
+    ]
 

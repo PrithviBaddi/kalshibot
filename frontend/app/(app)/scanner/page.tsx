@@ -5,7 +5,9 @@ import { api, Opportunity, formatApiError } from '@/lib/api'
 import { ApiErrorBanner } from '@/components/ApiErrorBanner'
 import { KalshiConnectionHint } from '@/components/KalshiConnectionHint'
 
-const CATEGORIES = ['Politics', 'Economics', 'Financials', 'Climate', 'Tech', 'Science', 'Culture']
+import { KALSHI_SCAN_CATEGORIES } from '@/lib/kalshiCategories'
+
+const CATEGORIES = [...KALSHI_SCAN_CATEGORIES]
 
 export default function ScannerPage() {
   const [category, setCategory] = useState('Politics')

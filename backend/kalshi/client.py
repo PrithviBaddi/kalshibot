@@ -198,6 +198,58 @@ class KalshiClient:
         resp.raise_for_status()
         return resp.json()
 
+    async def get_trades(self, ticker: str, *, limit: int = 200):
+        """Best-effort recent trades endpoint for fallback trend inference."""
+        seg = quote(str(ticker), safe="-_.~")
+        resp = await self._request("GET", f"/markets/{seg}/trades", params={"limit": int(limit)})
+        resp.raise_for_status()
+        return resp.json()
+
+    async def get_market_candlesticks(
+        self,
+        series_ticker: str,
+        ticker: str,
+        *,
+        start_ts: int,
+        end_ts: int,
+        period_interval: int,
+        include_latest_before_start: bool = False,
+    ):
+        """GET /series/{series_ticker}/markets/{ticker}/candlesticks (live markets)."""
+        st = quote(str(series_ticker), safe="-_.~")
+        tk = quote(str(ticker), safe="-_.~")
+        path = f"/series/{st}/markets/{tk}/candlesticks"
+        params: dict[str, int | str] = {
+            "start_ts": start_ts,
+            "end_ts": end_ts,
+            "period_interval": period_interval,
+        }
+        if include_latest_before_start:
+            params["include_latest_before_start"] = "true"
+        resp = await self._request("GET", path, params=params)
+        resp.raise_for_status()
+        return resp.json()
+
+    async def get_historical_market_candlesticks(
+        self,
+        ticker: str,
+        *,
+        start_ts: int,
+        end_ts: int,
+        period_interval: int,
+    ):
+        """GET /historical/markets/{ticker}/candlesticks (archived markets)."""
+        tk = quote(str(ticker), safe="-_.~")
+        path = f"/historical/markets/{tk}/candlesticks"
+        params = {
+            "start_ts": start_ts,
+            "end_ts": end_ts,
+            "period_interval": period_interval,
+        }
+        resp = await self._request("GET", path, params=params)
+        resp.raise_for_status()
+        return resp.json()
+
     async def place_order(self, ticker: str, side: str, count: int, price: int):
         """
         side: 'yes' or 'no'

@@ -126,9 +126,14 @@ Enable when you want **accounts**, **encrypted per-user Kalshi keys**, and optio
 |----------|---------|
 | `KALSHIBOT_USER_AUTH=1` | Turn on JWT auth + per-user SQLite rows (`user_id` on rules, paper, analysis, etc.) |
 | `JWT_SECRET` | Signing key for access tokens (long random string) |
-| `KALSHIBOT_CREDENTIALS_ENCRYPTION_KEY` | Fernet key for encrypting stored Kalshi PEMs (`python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`) |
+| `KALSHIBOT_CREDENTIALS_ENCRYPTION_KEY` | **Server** Fernet key (one generated line) for encrypting per-user Kalshi material in SQLite — **not** your Kalshi API Key ID or private key. Generate: `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"` |
 | `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `STRIPE_PRICE_ID` | Optional — subscription Checkout + webhook (`POST /api/v1/billing/webhook`) |
-| `PUBLIC_APP_URL` | Your Next.js origin for Stripe success/cancel redirects |
+| `PUBLIC_APP_URL` | Your Next.js origin for Stripe success/cancel redirects and Customer Portal `return_url` |
+| `FREE_TIER_ANALYSIS_PER_DAY` | Optional (default `25`) — per-user UTC-day cap on successful market analyses when not on Pro |
+| `FREE_TIER_NEWS` | Optional (`1` or `0`, default `1`) — whether free tier may include news in analysis when `NEWS_API_KEY` is set |
+| `FREE_TIER_SCANNER_PER_DAY` | Optional (default `40`) — per-user UTC-day cap on `GET /api/v1/scanner/opportunities` when not on Pro |
+| `FREE_TIER_JOB_RUNS_PER_DAY` | Optional (default `30`) — manual rule runs (`POST .../run-once`, `POST .../run-all-enabled-once`) per UTC day on Free |
+| `RESEND_API_KEY`, `EMAIL_FROM` | Optional — transactional email (e.g. password reset). Without them, reset links may only appear in server logs |
 
 **Frontend:** `NEXT_PUBLIC_USER_AUTH=1` so the UI shows login/register and the Settings form for Kalshi keys.
 

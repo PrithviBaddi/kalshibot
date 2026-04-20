@@ -2,7 +2,7 @@
 import { useState } from 'react'
 import Link from 'next/link'
 import { useRouter } from 'next/navigation'
-import { api, formatApiError, setAccessToken } from '@/lib/api'
+import { api, AuthTokenResponse, formatApiError, isUserAuthMode, setAccessToken, userIsPro } from '@/lib/api'
 
 export default function LoginPage() {
   const router = useRouter()
@@ -16,9 +16,11 @@ export default function LoginPage() {
     setLoading(true)
     setError('')
     try {
-      const r = await api.post<{ access_token: string }>('/api/v1/auth/login', { email, password })
+      const r = await api.post<AuthTokenResponse>('/api/v1/auth/login', { email, password })
       setAccessToken(r.access_token)
-      router.push('/dashboard')
+      if (!isUserAuthMode()) router.push('/dashboard')
+      else if (userIsPro(r.user)) router.push('/dashboard')
+      else router.push('/daily')
       router.refresh()
     } catch (err: unknown) {
       setError(formatApiError(err))
@@ -50,6 +52,8 @@ export default function LoginPage() {
         </form>
         <p style={{ marginTop: 20, fontSize: 12, color: 'var(--text2)' }}>
           No account? <Link href="/register" style={{ color: 'var(--accent)' }}>Create one</Link>
+          {' · '}
+          <Link href="/forgot-password" style={{ color: 'var(--text3)' }}>Forgot password?</Link>
           {' · '}
           <Link href="/legal/terms" style={{ color: 'var(--text3)' }}>Terms</Link>
         </p>
