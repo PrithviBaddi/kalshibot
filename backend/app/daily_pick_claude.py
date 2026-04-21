@@ -109,7 +109,7 @@ def apply_daily_pick_pass_rules(parsed: dict[str, Any]) -> dict[str, Any]:
     ra = _normalize_recommended_action(str(parsed.get("recommended_action", "PASS")))
     ae = abs(edge)
 
-    if ae < 0.10:
+    if ae <= 0.09:
         ra = "PASS"
     elif ae >= 0.40:
         if cs < 40:

@@ -284,12 +284,92 @@ _NEWS_STOPWORDS = frozenset(
 )
 
 
-def derive_three_news_queries(title: str) -> list[str]:
+_ECON_PREFIX_TO_QUERIES: dict[str, tuple[str, str, str]] = {
+    "KXADP": (
+        "ADP payroll report {month} 2026",
+        "private sector employment ADP {month} 2026",
+        "ADP National Employment Report jobs added",
+    ),
+    "KXFED": (
+        "Federal Reserve interest rate decision 2026",
+        "Fed funds rate FOMC meeting 2026",
+        "Federal Reserve rate cut 2026",
+    ),
+    "KXTERMINALRATE": (
+        "Federal Reserve interest rate decision 2026",
+        "Fed funds rate FOMC meeting 2026",
+        "Federal Reserve rate cut 2026",
+    ),
+    "KXRATECUTCOUNT": (
+        "Federal Reserve interest rate decision 2026",
+        "Fed funds rate FOMC meeting 2026",
+        "Federal Reserve rate cut 2026",
+    ),
+    "KXOIL": (
+        "oil price WTI crude 2026",
+        "energy prices outlook 2026",
+        "crude oil market April 2026",
+    ),
+    "KXNGASW": (
+        "oil price WTI crude 2026",
+        "energy prices outlook 2026",
+        "crude oil market April 2026",
+    ),
+    "KXJETFUEL": (
+        "oil price WTI crude 2026",
+        "energy prices outlook 2026",
+        "crude oil market April 2026",
+    ),
+    "KXJPY": (
+        "US dollar Japanese yen exchange rate 2026",
+        "JPY USD forex April 2026",
+        "Bank of Japan policy 2026",
+    ),
+    "KXCOIN": (
+        "Bitcoin price April 2026",
+        "crypto market 2026",
+        "BTC USD April 2026",
+    ),
+    "KXUSRETAIL": (
+        "March 2026 retail sales BLS report",
+        "US Census retail sales monthly advance report",
+        "retail sales MoM BLS release schedule",
+    ),
+    "KXCPI": (
+        "CPI March 2026 Bureau of Labor Statistics",
+        "BLS consumer price index monthly release",
+        "inflation report CPI seasonally adjusted BLS",
+    ),
+    "U3": (
+        "unemployment rate March 2026 BLS jobs report",
+        "BLS employment situation release unemployment rate",
+        "US labor market payroll report BLS",
+    ),
+    "GDPUSMAX": (
+        "US GDP advance estimate BEA release",
+        "GDP growth quarter annualized BEA report",
+        "Bureau of Economic Analysis GDP data release",
+    ),
+    "NGDP": (
+        "nominal GDP release BEA",
+        "US nominal gross domestic product report",
+        "Bureau of Economic Analysis nominal GDP",
+    ),
+}
+
+
+def derive_three_news_queries(title: str, ticker: str = "") -> list[str]:
     """
     Build three targeted queries from core subject/action words.
     - Removes resolution-date noise and framing words ("will", "before", "by").
     - Avoids including explicit deadline dates that pollute NewsAPI matching.
     """
+    tk = (ticker or "").strip().upper()
+    for pref, qs in _ECON_PREFIX_TO_QUERIES.items():
+        if tk.startswith(pref):
+            month = datetime.now(timezone.utc).strftime("%B")
+            return [q.replace("{month}", month) for q in qs]
+
     raw_words = re.findall(r"[A-Za-z0-9]+", title or "")
     stop = set(_NEWS_STOPWORDS) | {
         "before",
@@ -349,9 +429,9 @@ def derive_three_news_queries(title: str) -> list[str]:
     return out[:3]
 
 
-def daily_pick_query_words(title: str) -> set[str]:
+def daily_pick_query_words(title: str, ticker: str = "") -> set[str]:
     """Token set used to score NewsAPI and RSS headlines for the daily pick."""
-    queries = derive_three_news_queries(title)
+    queries = derive_three_news_queries(title, ticker=ticker)
     query_word_union: set[str] = set()
     for q in queries:
         for w in re.findall(r"[A-Za-z0-9]+", q):
@@ -369,12 +449,12 @@ def _headline_relevance_score(title: str, query_words: set[str]) -> int:
     return sum(1 for w in query_words if w in twords)
 
 
-async def fetch_news_triple_for_daily_pick(title: str) -> dict[str, Any]:
+async def fetch_news_triple_for_daily_pick(title: str, ticker: str = "") -> dict[str, Any]:
     """
     Three NewsAPI `everything` queries (7d window), dedupe by title, rank for merge with RSS (up to 12 candidates).
     """
     key = os.getenv("NEWS_API_KEY", "").strip()
-    queries = derive_three_news_queries(title)
+    queries = derive_three_news_queries(title, ticker=ticker)
     base: dict[str, Any] = {
         "configured": bool(key),
         "queries": queries,
@@ -394,7 +474,7 @@ async def fetch_news_triple_for_daily_pick(title: str) -> dict[str, Any]:
 
     merged: dict[str, dict[str, str]] = {}
     api_ok = 0
-    query_word_union = daily_pick_query_words(title)
+    query_word_union = daily_pick_query_words(title, ticker=ticker)
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(22.0)) as client:
         for q in queries:

@@ -244,6 +244,7 @@ async def _evaluate_one_candidate(k: KalshiClient, ticker: str, utc_day: str, pi
         "rss": news_daily.get("rss"),
     }
     analysis["fred_macro"] = briefing_pack.get("fred") or {}
+    analysis["bls_release"] = briefing_pack.get("bls") or {}
     analysis["expert_forecast"] = briefing_pack.get("expert")
     analysis["price_trend_summary"] = briefing_pack.get("price_trend_line")
     analysis["historical_feedback"] = briefing_pack.get("historical_lines")

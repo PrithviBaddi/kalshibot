@@ -12,6 +12,7 @@ from typing import Any
 
 import httpx
 
+from app.bls_data import fetch_latest_bls_series
 from app.db import list_global_daily_picks_for_similarity
 from app.fred_data import fetch_fred_economic_context
 from app.news_context import (
@@ -51,11 +52,12 @@ def merge_news_and_rss_headlines(
     news: dict[str, Any],
     rss: dict[str, Any],
     title: str,
+    ticker: str = "",
 ) -> dict[str, Any]:
     """
     Combine NewsAPI + RSS headlines, dedupe similar titles, keep top 10 by relevance score.
     """
-    qw = daily_pick_query_words(title)
+    qw = daily_pick_query_words(title, ticker=ticker)
     combined: list[dict[str, Any]] = []
 
     for h in news.get("headlines") or []:
@@ -125,6 +127,69 @@ def merge_news_and_rss_headlines(
         "rss_contributed": rss_contributed,
         "combined_ok": bool(picked),
     }
+
+
+def _is_economic_release_market(ticker: str, title: str) -> bool:
+    tk = (ticker or "").strip().upper()
+    prefixes = (
+        "KXUSRETAIL",
+        "KXCPI",
+        "U3",
+        "GDPUSMAX",
+        "NGDP",
+        "KXADP",
+        "KXFED",
+        "KXTERMINALRATE",
+        "KXRATECUTCOUNT",
+    )
+    if any(tk.startswith(p) for p in prefixes):
+        return True
+    tl = (title or "").lower()
+    return any(
+        kw in tl
+        for kw in (
+            "retail sales",
+            "consumer price index",
+            "cpi",
+            "unemployment",
+            "jobs report",
+            "gdp",
+            "gross domestic product",
+        )
+    )
+
+
+async def _economic_release_data_block(ticker: str, title: str) -> dict[str, Any]:
+    """
+    For economic release markets, fetch concrete BLS values (free public API).
+    Currently includes RSXFS for retail sales.
+    """
+    if not _is_economic_release_market(ticker, title):
+        return {"ok": False, "paragraph": "", "kind": None}
+    tk = (ticker or "").upper()
+    tl = (title or "").lower()
+    if tk.startswith("KXUSRETAIL") or "retail sales" in tl:
+        row = await fetch_latest_bls_series("RSXFS")
+        if row.get("ok"):
+            value = str(row.get("value") or "")
+            month = str(row.get("period_name") or "").strip()
+            year = str(row.get("year") or "").strip()
+            when = f"{month} {year}".strip()
+            paragraph = f"BLS reports retail sales (series RSXFS) latest value {when}: {value}."
+            return {"ok": True, "kind": "retail_sales", "paragraph": paragraph, "raw": row}
+    if tk.startswith("KXADP") or "adp" in tl or "private payroll" in tl:
+        row = await fetch_latest_bls_series("CES0000000001")
+        if row.get("ok"):
+            value = str(row.get("value") or "")
+            month = str(row.get("period_name") or "").strip()
+            year = str(row.get("year") or "").strip()
+            when = f"{month} {year}".strip()
+            paragraph = (
+                "BLS benchmark (series CES0000000001 total nonfarm payrolls) "
+                f"latest value {when}: {value}."
+            )
+            return {"ok": True, "kind": "adp_payroll_benchmark", "paragraph": paragraph, "raw": row}
+    return {"ok": False, "paragraph": "", "kind": None}
 
 
 def _topics_overlap(a: set[str], b: set[str]) -> bool:
@@ -378,9 +443,10 @@ async def build_daily_pick_briefing(
     else:
         sources.append("kalshi_price_history_unavailable")
 
-    news_raw = await fetch_news_triple_for_daily_pick(title)
-    rss_raw = await asyncio.to_thread(fetch_rss_for_daily_pick, title)
-    merged = merge_news_and_rss_headlines(news_raw, rss_raw, title)
+    ticker = str(market.get("ticker") or "")
+    news_raw = await fetch_news_triple_for_daily_pick(title, ticker=ticker)
+    rss_raw = await asyncio.to_thread(fetch_rss_for_daily_pick, title, ticker)
+    merged = merge_news_and_rss_headlines(news_raw, rss_raw, title, ticker=ticker)
     news = {
         **news_raw,
         "headlines": merged["headlines"],
@@ -405,6 +471,13 @@ async def build_daily_pick_briefing(
         fred_block = await fetch_fred_economic_context()
         if fred_block.get("ok") and str(fred_block.get("paragraph") or "").strip():
             sources.append("fred_economic_data")
+            tk_up = (ticker or "").upper()
+            if tk_up.startswith(("KXFED", "KXTERMINALRATE", "KXRATECUTCOUNT")):
+                sources.append("fred_fedfunds_for_rate_market")
+
+    bls_block = await _economic_release_data_block(ticker, title)
+    if bls_block.get("ok") and str(bls_block.get("paragraph") or "").strip():
+        sources.append("bls_release_data")
 
     expert = await fetch_expert_forecast_block(title)
     if expert.get("ok"):
@@ -419,6 +492,7 @@ async def build_daily_pick_briefing(
 
     news_block = str(news.get("prompt_block") or "No recent headlines found for this topic.")
     fred_line = str(fred_block.get("paragraph") or "").strip()
+    bls_line = str(bls_block.get("paragraph") or "").strip()
     expert_line = str(expert.get("prompt_line") or "")
     if not expert_line:
         expert_line = (
@@ -433,6 +507,9 @@ async def build_daily_pick_briefing(
     fred_section = ""
     if fred_line:
         fred_section = f"\n### US macro data (FRED — hard numbers)\n{fred_line}\n"
+    bls_section = ""
+    if bls_line:
+        bls_section = f"\n### Economic release data (BLS direct)\n{bls_line}\n"
 
     briefing = f"""## Structured context for this pick
 
@@ -442,6 +519,7 @@ async def build_daily_pick_briefing(
 ### Recent news (NewsAPI + RSS; merged, deduped; top headlines for this topic)
 {news_block}
 {fred_section}
+{bls_section}
 ### Expert / crowd forecasting sites (Metaculus, Manifold, Polymarket — headline scan)
 {expert_line}
 
@@ -454,6 +532,7 @@ async def build_daily_pick_briefing(
         "sources_used": sources,
         "news": news,
         "fred": fred_block,
+        "bls": bls_block,
         "expert": expert,
         "price_trend_line": trend_line,
         "historical_lines": hist_lines,

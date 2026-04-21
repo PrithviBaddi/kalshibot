@@ -19,11 +19,11 @@ from app.news_context import _headline_relevance_score, daily_pick_query_words
 logger = logging.getLogger(__name__)
 
 _RSS_FEEDS: tuple[tuple[str, str], ...] = (
-    ("https://feeds.reuters.com/reuters/politicsNews", "Reuters"),
-    ("https://feeds.reuters.com/reuters/businessNews", "Reuters"),
-    ("https://feeds.apnews.com/rss/apf-politics", "AP News"),
-    ("https://www.politico.com/rss/politicopicks.xml", "Politico"),
+    ("https://rss.nytimes.com/services/xml/rss/nyt/Politics.xml", "NYTimes Politics"),
+    ("https://feeds.washingtonpost.com/rss/politics", "Washington Post Politics"),
+    ("https://www.economist.com/united-states/rss.xml", "Economist US"),
 )
+_BLS_RELEASE_CALENDAR_URL = "https://www.bls.gov/bls/news-release/home.htm"
 
 _USER_AGENT = "KalshiBot/1.0 (+https://kalshibot.local; RSS reader)"
 _FETCH_TIMEOUT_SEC = 22
@@ -163,12 +163,43 @@ def _fetch_url(url: str) -> bytes:
         return resp.read()
 
 
-def fetch_rss_for_daily_pick(title: str) -> dict[str, Any]:
+def _bls_release_headlines() -> list[dict[str, str]]:
+    """
+    HTML fallback when RSS is blocked: scrape coarse release lines from BLS news-release page.
+    """
+    try:
+        raw = _fetch_url(_BLS_RELEASE_CALENDAR_URL)
+    except Exception as e:
+        logger.warning("RSS fallback BLS fetch failed url=%s err=%s", _BLS_RELEASE_CALENDAR_URL, e)
+        return []
+    text = raw.decode("utf-8", errors="ignore")
+    # Best-effort extraction from anchor text. Keep it simple and robust.
+    titles = re.findall(r">([^<]{8,180}(?:Consumer Price Index|Employment Situation|Retail Sales|GDP|Productivity|Unemployment)[^<]{0,140})<", text, re.I)
+    out: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for t in titles[:20]:
+        clean = re.sub(r"\s+", " ", t).strip()
+        k = clean.casefold()
+        if not clean or k in seen:
+            continue
+        seen.add(k)
+        out.append(
+            {
+                "title": clean[:500],
+                "source": "BLS release calendar",
+                "published_at": "latest",
+                "published_raw": "",
+            }
+        )
+    return out
+
+
+def fetch_rss_for_daily_pick(title: str, ticker: str = "") -> dict[str, Any]:
     """
     Fetch configured RSS feeds, score headlines vs daily pick query words, return top 5 overall.
     Synchronous; call from asyncio.to_thread in async code paths.
     """
-    qw = daily_pick_query_words(title)
+    qw = daily_pick_query_words(title, ticker=ticker)
     if not qw:
         return {
             "ok": False,
@@ -180,13 +211,16 @@ def fetch_rss_for_daily_pick(title: str) -> dict[str, Any]:
 
     scored: list[dict[str, Any]] = []
     feeds_ok = 0
+    feed_status: dict[str, str] = {}
     for url, default_src in _RSS_FEEDS:
         try:
             raw = _fetch_url(url)
         except Exception as e:
             logger.warning("RSS fetch failed url=%s err=%s", url, e)
+            feed_status[url] = f"failed: {e}"
             continue
         feeds_ok += 1
+        feed_status[url] = "ok"
         items = _parse_rss_items(raw, default_src)
         for it in items:
             t = it.get("title") or ""
@@ -194,6 +228,19 @@ def fetch_rss_for_daily_pick(title: str) -> dict[str, Any]:
             if sc <= 0:
                 continue
             scored.append({**it, "relevance_score": sc})
+
+    if not scored:
+        bls_items = _bls_release_headlines()
+        if bls_items:
+            logger.info("RSS fallback: using BLS release calendar headlines count=%s", len(bls_items))
+            for it in bls_items:
+                t = it.get("title") or ""
+                sc = _headline_relevance_score(t, qw)
+                if sc <= 0:
+                    continue
+                scored.append({**it, "relevance_score": sc})
+        else:
+            logger.warning("RSS: no feed produced relevant headlines and BLS fallback returned none")
 
     scored.sort(
         key=lambda x: (int(x.get("relevance_score") or 0), str(x.get("published_raw") or "")),
@@ -225,4 +272,5 @@ def fetch_rss_for_daily_pick(title: str) -> dict[str, Any]:
         "headlines": top,
         "prompt_block": prompt_block,
         "feeds_ok": feeds_ok,
+        "feed_status": feed_status,
     }
