@@ -1315,6 +1315,20 @@ def resolve_global_daily_pick(
         return cur.rowcount > 0
 
 
+def delete_global_daily_pick(day: str) -> bool:
+    """Delete one UTC day pick row. Returns True if a row was deleted."""
+    with connect() as con:
+        cur = con.execute(
+            """
+            DELETE FROM global_daily_picks
+            WHERE day = ?
+            """,
+            (day,),
+        )
+        con.commit()
+        return cur.rowcount > 0
+
+
 def list_global_daily_picks_for_similarity(*, before_day: str, limit_rows: int = 200) -> list[dict[str, Any]]:
     """Past picks (strictly before `before_day`) for keyword overlap / feedback context."""
     lim = max(1, min(int(limit_rows), 500))

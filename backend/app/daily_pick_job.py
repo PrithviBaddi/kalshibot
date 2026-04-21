@@ -31,8 +31,8 @@ _MAX_SPREAD_RELAXED = 0.15
 _MIN_FILTERED_BEFORE_SPREAD_RELAX = 3
 _MAX_DAYS_TO_RESOLVE = 90
 _TOP_CANDIDATES_TO_EVALUATE = 5
-_MIN_MID_PROB = 0.05
-_MAX_MID_PROB = 0.95
+_MIN_MID_PROB = 0.15
+_MAX_MID_PROB = 0.85
 _SPORTS_TERMS = ("sport", "nba", "nfl", "mlb", "nhl", "soccer", "ncaa", "tennis", "golf", "mma", "ufc")
 
 # UTC weekday: Mon=0 … Sun=6. Sun runs a 3-way tournament (highest pool score wins).

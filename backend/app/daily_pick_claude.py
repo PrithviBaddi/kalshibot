@@ -6,10 +6,13 @@ Model for this path: claude-sonnet-4-6 (override with ANTHROPIC_MODEL_DAILY_PICK
 
 from __future__ import annotations
 
+import logging
 import os
 from typing import Any
 
 from app.claude_enrichment import _anthropic_messages_json, _extract_json_object
+
+logger = logging.getLogger(__name__)
 
 DAILY_PICK_MODEL_DEFAULT = "claude-sonnet-4-6"
 
@@ -184,6 +187,7 @@ async def enrich_daily_pick_with_claude(
     Uses claude-sonnet-4-6 unless ANTHROPIC_MODEL_DAILY_PICK is set (never Haiku by default).
     """
     if not os.getenv("ANTHROPIC_API_KEY", "").strip():
+        logger.warning("Daily pick Claude skipped: ANTHROPIC_API_KEY is not configured")
         return None, None
 
     model_id = os.getenv("ANTHROPIC_MODEL_DAILY_PICK", "").strip() or DAILY_PICK_MODEL_DEFAULT
@@ -197,13 +201,18 @@ async def enrich_daily_pick_with_claude(
         implied_decimal=implied,
         structured_briefing=structured_briefing,
     )
-    text = await _anthropic_messages_json(
-        system=DAILY_PICK_SYSTEM_PROMPT,
-        user=user,
-        max_tokens=900,
-        model=model_id,
-    )
+    try:
+        text = await _anthropic_messages_json(
+            system=DAILY_PICK_SYSTEM_PROMPT,
+            user=user,
+            max_tokens=900,
+            model=model_id,
+        )
+    except Exception as e:
+        logger.warning("Daily pick Claude call failed unexpectedly: %s", e)
+        return None, None
     if not text:
+        logger.warning("Daily pick Claude returned no content; falling back to baseline")
         return None, None
 
     obj = _extract_json_object(text)

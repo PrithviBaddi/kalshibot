@@ -1,4 +1,12 @@
-const BASE = process.env.NEXT_PUBLIC_API_BASE ?? 'http://127.0.0.1:8000'
+function normalizeApiBase(raw: string | undefined): string {
+  const v = (raw ?? '').trim()
+  if (!v) return 'http://127.0.0.1:8000'
+  if (/^https?:\/\//i.test(v)) return v.replace(/\/+$/, '')
+  // Allow shorthand like "my-api.up.railway.app" in env files.
+  return `https://${v.replace(/\/+$/, '')}`
+}
+
+const BASE = normalizeApiBase(process.env.NEXT_PUBLIC_API_BASE)
 
 /** Public for error messages and diagnostics */
 export function getApiBaseUrl(): string {

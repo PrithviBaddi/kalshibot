@@ -12,6 +12,7 @@ from app.api_auth import get_api_token
 from app.daily_pick_job import run_daily_pick_generation
 from app.db import (
     _utc_day_string,
+    delete_global_daily_pick,
     get_daily_pick_accuracy_stats,
     get_global_daily_pick,
     list_global_daily_pick_history,
@@ -146,6 +147,17 @@ async def generate_daily_pick(request: Request) -> dict[str, Any]:
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e)) from e
     return {"ok": True, **out}
+
+
+@router.delete("/today")
+async def delete_today_pick(request: Request) -> dict[str, Any]:
+    """Operator/admin: delete today's stored pick so generation can be rerun."""
+    _require_admin_bearer(request)
+    day = _utc_day_string()
+    deleted = delete_global_daily_pick(day)
+    if not deleted:
+        raise HTTPException(status_code=404, detail=f"No daily pick stored for UTC day {day}.")
+    return {"ok": True, "deleted": True, "day": day}
 
 
 @router.post("/resolve")

@@ -8,11 +8,14 @@ On any failure, returns None and the caller keeps the deterministic baseline.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 from typing import Any, Literal
 
 import httpx
+
+logger = logging.getLogger(__name__)
 
 
 def _append_news_headlines(user: str, news_headlines: list[dict[str, str]] | None) -> str:
@@ -55,6 +58,7 @@ async def _anthropic_messages_json(
 ) -> str | None:
     key = os.getenv("ANTHROPIC_API_KEY", "").strip()
     if not key:
+        logger.warning("Claude call skipped: ANTHROPIC_API_KEY is not configured")
         return None
     payload = {
         "model": model,
@@ -75,7 +79,23 @@ async def _anthropic_messages_json(
             )
             resp.raise_for_status()
             data = resp.json()
-    except (httpx.HTTPError, ValueError, json.JSONDecodeError):
+    except httpx.HTTPStatusError as e:
+        body = ""
+        try:
+            body = (e.response.text or "")[:500]
+        except Exception:
+            body = ""
+        logger.warning(
+            "Claude call failed: status=%s body=%s",
+            getattr(e.response, "status_code", "unknown"),
+            body,
+        )
+        return None
+    except httpx.HTTPError as e:
+        logger.warning("Claude call failed: network error: %s", e)
+        return None
+    except (ValueError, json.JSONDecodeError) as e:
+        logger.warning("Claude call failed: invalid JSON response: %s", e)
         return None
 
     text = ""
