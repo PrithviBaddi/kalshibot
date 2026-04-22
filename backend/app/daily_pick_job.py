@@ -231,10 +231,10 @@ async def _evaluate_one_candidate(k: KalshiClient, ticker: str, utc_day: str, pi
         utc_day=utc_day,
         pick_category=pick_category,
     )
-    briefing_text = str(briefing_pack.get("briefing") or "")
+    hist_lines = list(briefing_pack.get("historical_lines") or [])
     sources_used: list[str] = list(briefing_pack.get("sources_used") or [])
     news_daily = briefing_pack.get("news") or {}
-    prompt_block = str(news_daily.get("prompt_block") or "No recent headlines found for this topic.")
+    prompt_block = str(news_daily.get("prompt_block") or "")
     analysis["news"] = {
         "configured": news_daily.get("configured"),
         "ok": news_daily.get("ok"),
@@ -247,16 +247,22 @@ async def _evaluate_one_candidate(k: KalshiClient, ticker: str, utc_day: str, pi
     analysis["bls_release"] = briefing_pack.get("bls") or {}
     analysis["expert_forecast"] = briefing_pack.get("expert")
     analysis["price_trend_summary"] = briefing_pack.get("price_trend_line")
-    analysis["historical_feedback"] = briefing_pack.get("historical_lines")
+    analysis["historical_feedback"] = hist_lines
 
-    enriched, raw = await enrich_daily_pick_with_claude(
+    enriched, raw, tool_tags = await enrich_daily_pick_with_claude(
         analysis,
         market,
-        structured_briefing=briefing_text,
+        k=k,
+        historical_lines=hist_lines,
     )
+    if tool_tags:
+        sources_used.extend(tool_tags)
     used_claude = enriched is not None
     if used_claude:
         analysis = enriched
+        rh2 = analysis.get("claude_research_headlines")
+        if isinstance(rh2, list) and rh2 and isinstance(analysis.get("news"), dict):
+            analysis["news"] = {**analysis["news"], "headlines": rh2[:12], "ok": True}
 
     model_y = float(analysis.get("model_yes_probability") or implied)
     edge = float(analysis.get("edge", model_y - implied))
@@ -266,6 +272,11 @@ async def _evaluate_one_candidate(k: KalshiClient, ticker: str, utc_day: str, pi
     if rec not in ("BUY_YES", "BUY_NO", "PASS"):
         rec = "PASS"
     reasoning = str(analysis.get("reasoning") or analysis.get("rationale") or "").strip()
+
+    research_h = analysis.get("claude_research_headlines")
+    headlines_out: list[Any] = research_h if isinstance(research_h, list) and research_h else list(
+        news_daily.get("headlines") or []
+    )
 
     return {
         "ticker": ticker,
@@ -279,7 +290,7 @@ async def _evaluate_one_candidate(k: KalshiClient, ticker: str, utc_day: str, pi
         "reasoning": reasoning,
         "used_claude": used_claude,
         "raw_claude": raw,
-        "headlines": news_daily.get("headlines", []),
+        "headlines": headlines_out,
         "prompt_block": prompt_block,
         "context_sources_used": sources_used,
     }

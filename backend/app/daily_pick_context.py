@@ -1,10 +1,12 @@
 """
-Enriched structured briefing for daily pick: Kalshi trend, multi-query news, expert sites, past picks.
+Daily pick context helpers: historical similarity, Kalshi 7-day trend, BLS release blocks.
+
+News and macro briefings for the daily pick are no longer assembled here; Claude fetches
+those via tools in `daily_pick_claude.py`.
 """
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import re
 import time
@@ -14,15 +16,7 @@ import httpx
 
 from app.bls_data import fetch_latest_bls_series
 from app.db import list_global_daily_picks_for_similarity
-from app.fred_data import fetch_fred_economic_context
-from app.news_context import (
-    _NEWS_STOPWORDS,
-    _headline_relevance_score,
-    daily_pick_query_words,
-    fetch_expert_forecast_block,
-    fetch_news_triple_for_daily_pick,
-)
-from app.news_rss import fetch_rss_for_daily_pick
+from app.news_context import _NEWS_STOPWORDS
 from kalshi.client import KalshiClient
 
 logger = logging.getLogger(__name__)
@@ -33,99 +27,6 @@ def _title_tokens(title: str) -> set[str]:
         w.lower()
         for w in re.findall(r"[A-Za-z0-9]+", title or "")
         if len(w) > 2 and w.lower() not in _NEWS_STOPWORDS
-    }
-
-
-def _headline_similar(a: str, b: str) -> bool:
-    if (a or "").casefold() == (b or "").casefold():
-        return True
-    ta = {w for w in re.findall(r"[A-Za-z0-9]+", (a or "").lower()) if len(w) > 2}
-    tb = {w for w in re.findall(r"[A-Za-z0-9]+", (b or "").lower()) if len(w) > 2}
-    if not ta or not tb:
-        return False
-    inter = len(ta & tb)
-    union = len(ta | tb) or 1
-    return inter / union >= 0.55
-
-
-def merge_news_and_rss_headlines(
-    news: dict[str, Any],
-    rss: dict[str, Any],
-    title: str,
-    ticker: str = "",
-) -> dict[str, Any]:
-    """
-    Combine NewsAPI + RSS headlines, dedupe similar titles, keep top 10 by relevance score.
-    """
-    qw = daily_pick_query_words(title, ticker=ticker)
-    combined: list[dict[str, Any]] = []
-
-    for h in news.get("headlines") or []:
-        if not isinstance(h, dict):
-            continue
-        t = str(h.get("title") or "").strip()
-        if not t:
-            continue
-        combined.append(
-            {
-                "title": t[:500],
-                "source": str(h.get("source") or "NewsAPI")[:160],
-                "published_at": str(h.get("published_at") or ""),
-                "origin": "newsapi",
-                "relevance_score": _headline_relevance_score(t, qw),
-            }
-        )
-
-    for h in rss.get("headlines") or []:
-        if not isinstance(h, dict):
-            continue
-        t = str(h.get("title") or "").strip()
-        if not t:
-            continue
-        combined.append(
-            {
-                "title": t[:500],
-                "source": str(h.get("source") or "RSS")[:160],
-                "published_at": str(h.get("published_at") or ""),
-                "origin": "rss",
-                "relevance_score": _headline_relevance_score(t, qw),
-            }
-        )
-
-    combined.sort(
-        key=lambda x: (int(x.get("relevance_score") or 0), str(x.get("published_at") or "")),
-        reverse=True,
-    )
-
-    picked: list[dict[str, str]] = []
-    for row in combined:
-        t = str(row.get("title") or "").strip()
-        if int(row.get("relevance_score") or 0) <= 0:
-            continue
-        if any(_headline_similar(t, p["title"]) for p in picked):
-            continue
-        picked.append(
-            {
-                "title": t[:500],
-                "source": str(row.get("source") or "")[:160],
-                "published_at": str(row.get("published_at") or ""),
-            }
-        )
-        if len(picked) >= 10:
-            break
-
-    rss_title_cf = {str(h.get("title") or "").casefold() for h in rss.get("headlines") or [] if isinstance(h, dict)}
-    final_cf = {p["title"].casefold() for p in picked}
-    rss_contributed = bool(rss_title_cf & final_cf)
-
-    lines = [f"[{h['source']}, {h['published_at']}]: {h['title']}" for h in picked]
-    prompt_block = "\n".join(lines) if lines else "No recent headlines found for this topic."
-
-    return {
-        "headlines": picked,
-        "prompt_block": prompt_block,
-        "rss_contributed": rss_contributed,
-        "combined_ok": bool(picked),
     }
 
 
@@ -314,7 +215,6 @@ async def fetch_kalshi_seven_day_trend_sentence(k: KalshiClient, market: dict[st
             data = None
 
     if not isinstance(data, dict) or not data.get("candlesticks"):
-        # Fallback 1: recent trades endpoint (best-effort)
         try:
             trades_blob = await k.get_trades(ticker, limit=250)
             trades = trades_blob.get("trades") if isinstance(trades_blob, dict) else None
@@ -364,7 +264,6 @@ async def fetch_kalshi_seven_day_trend_sentence(k: KalshiClient, market: dict[st
         except httpx.HTTPError as e:
             logger.warning("Kalshi trades fallback network error ticker=%s err=%s", ticker, e)
 
-        # Fallback 2: current orderbook snapshot (very weak substitute, but explicit).
         try:
             ob = await k.get_orderbook(ticker)
             logger.warning("Kalshi orderbook fallback used ticker=%s response=%s", ticker, str(ob)[:1200])
@@ -433,107 +332,43 @@ async def build_daily_pick_briefing(
     pick_category: str = "",
 ) -> dict[str, Any]:
     """
-    Assemble structured briefing text + `sources_used` tags + raw news/expert blobs for persistence.
+    Minimal briefing for the daily pick job: historical lines only.
+
+    Kalshi trend, news, FRED, BLS, and expert context are fetched by Claude via tools on demand.
     """
+    _ = (k, market, pick_category)
+
     sources: list[str] = []
-
-    trend_line, trend_ok = await fetch_kalshi_seven_day_trend_sentence(k, market)
-    if trend_ok:
-        sources.append("kalshi_price_history")
-    else:
-        sources.append("kalshi_price_history_unavailable")
-
-    ticker = str(market.get("ticker") or "")
-    news_raw = await fetch_news_triple_for_daily_pick(title, ticker=ticker)
-    rss_raw = await asyncio.to_thread(fetch_rss_for_daily_pick, title, ticker)
-    merged = merge_news_and_rss_headlines(news_raw, rss_raw, title, ticker=ticker)
-    news = {
-        **news_raw,
-        "headlines": merged["headlines"],
-        "prompt_block": merged["prompt_block"],
-        "ok": bool(merged.get("combined_ok"))
-        or bool(news_raw.get("ok"))
-        or bool(rss_raw.get("ok")),
-        "rss": rss_raw,
-    }
-    if merged.get("rss_contributed"):
-        sources.append("rss_feeds")
-
-    news_ok_count = int(news_raw.get("api_ok_count") or 0)
-    if news_ok_count >= 3:
-        sources.append("newsapi_3_queries")
-    elif news_ok_count >= 1:
-        sources.append(f"newsapi_{news_ok_count}_of_3_queries")
-
-    fred_block: dict[str, Any] = {"ok": False, "paragraph": ""}
-    cat = (pick_category or "").strip()
-    if cat in ("Economics", "Financials"):
-        fred_block = await fetch_fred_economic_context()
-        if fred_block.get("ok") and str(fred_block.get("paragraph") or "").strip():
-            sources.append("fred_economic_data")
-            tk_up = (ticker or "").upper()
-            if tk_up.startswith(("KXFED", "KXTERMINALRATE", "KXRATECUTCOUNT")):
-                sources.append("fred_fedfunds_for_rate_market")
-
-    bls_block = await _economic_release_data_block(ticker, title)
-    if bls_block.get("ok") and str(bls_block.get("paragraph") or "").strip():
-        sources.append("bls_release_data")
-
-    expert = await fetch_expert_forecast_block(title)
-    if expert.get("ok"):
-        if expert.get("found"):
-            sources.append("metaculus_forecast_found")
-        else:
-            sources.append("expert_forecast_none")
-
     hist_lines, hist_n = build_historical_feedback_lines(current_title=title, utc_day=utc_day)
     if hist_n > 0:
         sources.append(f"historical_context_{hist_n}_matches")
-
-    news_block = str(news.get("prompt_block") or "No recent headlines found for this topic.")
-    fred_line = str(fred_block.get("paragraph") or "").strip()
-    bls_line = str(bls_block.get("paragraph") or "").strip()
-    expert_line = str(expert.get("prompt_line") or "")
-    if not expert_line:
-        expert_line = (
-            "Expert / crowd forecasts: No clear Metaculus / Manifold / Polymarket headline estimate found in recent search results."
-        )
 
     if hist_lines:
         hist_section = "\n".join(f"- {ln}" for ln in hist_lines)
     else:
         hist_section = "- No closely related resolved picks in our database."
 
-    fred_section = ""
-    if fred_line:
-        fred_section = f"\n### US macro data (FRED — hard numbers)\n{fred_line}\n"
-    bls_section = ""
-    if bls_line:
-        bls_section = f"\n### Economic release data (BLS direct)\n{bls_line}\n"
-
-    briefing = f"""## Structured context for this pick
-
-### Kalshi price action (7 days)
-{trend_line}
-
-### Recent news (NewsAPI + RSS; merged, deduped; top headlines for this topic)
-{news_block}
-{fred_section}
-{bls_section}
-### Expert / crowd forecasting sites (Metaculus, Manifold, Polymarket — headline scan)
-{expert_line}
-
-### Our historical context (similar past picks)
+    briefing = f"""## Similar past picks (internal only)
 {hist_section}
 """
+
+    news_stub: dict[str, Any] = {
+        "configured": True,
+        "ok": False,
+        "mode": "agentic_claude",
+        "headlines": [],
+        "prompt_block": "Claude gathers news via the web_search tool during analysis.",
+        "queries": [],
+        "rss": None,
+    }
 
     return {
         "briefing": briefing.strip(),
         "sources_used": sources,
-        "news": news,
-        "fred": fred_block,
-        "bls": bls_block,
-        "expert": expert,
-        "price_trend_line": trend_line,
+        "news": news_stub,
+        "fred": {},
+        "bls": {},
+        "expert": {"ok": False, "found": False, "prompt_line": ""},
+        "price_trend_line": None,
         "historical_lines": hist_lines,
     }

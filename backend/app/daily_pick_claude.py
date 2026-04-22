@@ -1,41 +1,115 @@
 """
-Daily pick — Claude analyst prompt, JSON parsing, and server-side PASS rules.
+Daily pick — Claude analyst with native tool use (web, Kalshi, FRED, BLS), JSON output, PASS rules.
 
 Model for this path: claude-sonnet-4-6 (override with ANTHROPIC_MODEL_DAILY_PICK only).
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import os
+import re
 from typing import Any
 
-from app.claude_enrichment import _anthropic_messages_json, _extract_json_object
+import httpx
+
+from app.claude_enrichment import _extract_json_object
+from app.daily_pick_context import _economic_release_data_block, fetch_kalshi_seven_day_trend_sentence
+from app.fred_data import fetch_fred_economic_context
+from app.scanner import summarize_market
+from kalshi.client import KalshiClient
 
 logger = logging.getLogger(__name__)
 
 DAILY_PICK_MODEL_DEFAULT = "claude-sonnet-4-6"
 
+DAILY_PICK_TOOLS: list[dict[str, Any]] = [
+    {
+        "name": "web_search",
+        "description": (
+            "Search the public web for recent news or context. "
+            "Prefer queries tied to the market title, ticker, or resolution criteria. "
+            "Returns up to 5 results (title, URL, snippet)."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Search query string.",
+                },
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "get_kalshi_market",
+        "description": "Fetch current Kalshi order book and metadata for a contract by ticker.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "ticker": {"type": "string", "description": "Kalshi market ticker."},
+            },
+            "required": ["ticker"],
+        },
+    },
+    {
+        "name": "get_kalshi_price_history",
+        "description": "Summarize roughly 7-day YES price trend from Kalshi candles or fallbacks.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "ticker": {"type": "string", "description": "Kalshi market ticker."},
+            },
+            "required": ["ticker"],
+        },
+    },
+    {
+        "name": "get_economic_data",
+        "description": (
+            "Latest US macro snapshot from FRED: Fed funds rate, CPI YoY, unemployment, real GDP YoY. "
+            "No API key returns an error stub."
+        ),
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "get_bls_release_data",
+        "description": (
+            "For supported economic-release contracts, fetch a direct BLS series value "
+            "(e.g. retail sales RSXFS, payrolls for ADP-style markets)."
+        ),
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+]
+
+TOOL_SOURCE_TAGS: dict[str, str] = {
+    "web_search": "claude_used_web_search",
+    "get_kalshi_market": "claude_used_kalshi_market",
+    "get_kalshi_price_history": "claude_used_kalshi_price_history",
+    "get_economic_data": "claude_used_get_economic_data",
+    "get_bls_release_data": "claude_used_get_bls_release_data",
+}
+
 DAILY_PICK_SYSTEM_PROMPT = """You are an analyst helping readers understand one Kalshi prediction market for a daily email–style pick.
 
-You only use public information provided in the briefing: the market text, the Kalshi-implied chance of YES, the 7-day Kalshi price trend summary, the multi-source news scan, any expert/crowd forecast lines (Metaculus / Manifold / Polymarket headline scan), and our notes on similar past picks. You do not have insider information.
+You have tools: web_search, get_kalshi_market, get_kalshi_price_history, get_economic_data (FRED macro: fed funds, CPI, unemployment, GDP), and get_bls_release_data (direct BLS values for supported release-style contracts). Use them during your reasoning — you are not given a pre-built news or macro briefing.
 
-You must explicitly use all four context sources when they contain substantive information:
-1) Kalshi 7-day price trend — cite whether YES pricing moved, held flat, or tilted toward NO.
-2) News — cite at least one headline (paraphrase is fine) when headlines exist; if the news block says none were found, say so.
-3) Expert / crowd forecasts — if a forecast probability is quoted, compare it to Kalshi; if the briefing says none was found, acknowledge that gap.
-4) Historical context — if we list similar past picks and whether we were right or wrong, weigh that carefully; if none are listed, say we have no close internal precedent.
+Rules:
+- Before your final answer, you MUST call web_search at least once with a query that is clearly relevant to this market or its resolution (recent news, official schedules, or key facts). If the first search is weak, run another query.
+- Use get_kalshi_market / get_kalshi_price_history when pricing or momentum matters.
+- Use get_economic_data and/or get_bls_release_data when the question is macro or an official economic statistic.
 
-If an expert or crowd forecast is available and is **meaningfully different** from the Kalshi-implied YES (roughly 12+ percentage points apart), your "reasoning" must briefly explain plausible reasons for that disagreement (information, timing, selection, or trader bias) in plain English.
+You only rely on tool outputs plus the market text and Kalshi-implied YES we give you (and the short internal historical note in the user message). You do not have insider information.
 
 Your job:
 1. Restate the Kalshi-implied probability of YES clearly (use the number we give you).
-2. Give your own estimate of the real-world probability that YES happens, using the briefing when relevant and general knowledge when helpful.
-3. In plain English, explain the gap between Kalshi’s view and yours (why they might differ, or why they align).
-4. Give a confidence score from 1 to 100 based on how much solid, relevant evidence you have—not trading confidence, not “gut feel.” Low scores when context is missing, irrelevant, or contradictory.
-5. Compute edge = (your estimated P(YES)) minus (Kalshi-implied P(YES)), using probabilities as decimals between 0 and 1 (e.g. market 0.40 and you 0.55 means edge 0.15, i.e. 15 percentage points).
+2. Give your own estimate of the real-world probability that YES happens, using tool-grounded evidence when relevant and general reasoning when helpful.
+3. In plain English, explain the gap between Kalshi’s view and yours.
+4. Give a confidence score from 1 to 100 based on how much solid, relevant evidence you have—not trading confidence, not “gut feel.”
+5. Compute edge = (your estimated P(YES)) minus (Kalshi-implied P(YES)), as decimals between 0 and 1.
 
-Output rules:
+Output rules (final turn only — after you are done calling tools):
 - Respond with a single JSON object only. No markdown, no code fences, no text before or after the JSON.
 - Required keys and types:
   - "model_yes_probability": number between 0.02 and 0.98 (your P(YES))
@@ -54,33 +128,32 @@ Recommendation rule (we also enforce this in software):
 This is educational context only, not financial advice."""
 
 
-def build_daily_pick_user_prompt(
+def build_agentic_daily_pick_user_message(
     *,
     ticker: str,
     title: str,
     implied_decimal: float,
-    structured_briefing: str,
+    historical_lines: list[str] | None,
 ) -> str:
     pct = implied_decimal * 100.0
+    lines = historical_lines or []
+    if lines:
+        hist = "\n".join(f"- {ln}" for ln in lines)
+    else:
+        hist = "- No closely related resolved picks in our database."
     return f"""Kalshi contract ticker: {ticker}
 
 Question (exact contract text):
 {title}
 
-Kalshi-implied probability of YES (from mid / stated mid): {pct:.1f}%  (decimal {implied_decimal:.6f})
+Kalshi-implied probability of YES (from mid): {pct:.1f}%  (decimal {implied_decimal:.6f})
 
-{structured_briefing}
+### Our historical context (similar past picks — internal DB only)
+{hist}
 
-Instructions:
-1. State the Kalshi-implied probability of YES in one short phrase in your JSON reasoning (first sentence).
-2. Weave in the price trend, news, expert/crowd lines, and historical context where applicable (per system rules).
-3. Give your real-world P(YES) as model_yes_probability.
-4. Explain the gap vs Kalshi in plain English in "reasoning" (2–3 sentences max). If an expert forecast disagrees strongly with Kalshi, address why.
-5. Set confidence_score 1–100 from evidence quality across all sources.
-6. Set edge = model_yes_probability − {implied_decimal:.6f} (you may recompute; we will verify in code).
-7. Set recommended_action to BUY_YES, BUY_NO, or PASS using the server PASS rules (tiny |edge| → PASS; large |edge| allows lower confidence — see system prompt).
+Use your tools to research this market. You must call web_search at least once with a relevant query before the final JSON.
 
-Return only the JSON object."""
+When ready, output only the JSON object with keys: model_yes_probability, confidence_score, reasoning, recommended_action, edge (edge = model_yes_probability − {implied_decimal:.6f})."""
 
 
 def _normalize_recommended_action(raw: str) -> str:
@@ -99,7 +172,7 @@ def _normalize_recommended_action(raw: str) -> str:
 def apply_daily_pick_pass_rules(parsed: dict[str, Any]) -> dict[str, Any]:
     """
     Final authority for actionable recommendations:
-    - Always PASS if |edge| < 0.10.
+    - Always PASS if |edge| <= 0.09.
     - If |edge| >= 0.40: allow BUY_YES/BUY_NO when confidence_score >= 40.
     - Elif |edge| >= 0.20: allow when confidence_score >= 50.
     - Elif |edge| >= 0.10: allow only when confidence_score >= 60 (marginal edge).
@@ -118,7 +191,6 @@ def apply_daily_pick_pass_rules(parsed: dict[str, Any]) -> dict[str, Any]:
         if cs < 50:
             ra = "PASS"
     else:
-        # 0.10 <= ae < 0.20
         if cs < 60:
             ra = "PASS"
 
@@ -176,54 +248,557 @@ def _confidence_label_from_score(score: int) -> str:
     return "low"
 
 
+def _extract_text_blocks(content: list[Any]) -> str:
+    parts: list[str] = []
+    for b in content or []:
+        if isinstance(b, dict) and b.get("type") == "text":
+            parts.append(str(b.get("text") or ""))
+    return "".join(parts).strip()
+
+
+def _extract_json_with_key(raw_text: str, required_key: str = "model_yes_probability") -> dict[str, Any] | None:
+    """
+    Robustly extract one JSON object containing `required_key` from mixed text.
+    Tries:
+    1) existing helper
+    2) fenced ```json blocks
+    3) brace-balanced scan over all `{...}` candidates
+    """
+    txt = (raw_text or "").strip()
+    if not txt:
+        return None
+
+    first_try = _extract_json_object(txt)
+    if isinstance(first_try, dict) and required_key in first_try:
+        return first_try
+
+    for m in re.finditer(r"```(?:json)?\s*([\s\S]*?)```", txt, flags=re.IGNORECASE):
+        inner = (m.group(1) or "").strip()
+        obj = _extract_json_object(inner)
+        if isinstance(obj, dict) and required_key in obj:
+            return obj
+
+    starts = [i for i, ch in enumerate(txt) if ch == "{"]
+    for s in starts:
+        depth = 0
+        in_str = False
+        esc = False
+        for i in range(s, len(txt)):
+            ch = txt[i]
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    in_str = False
+                continue
+            if ch == '"':
+                in_str = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    candidate = txt[s : i + 1]
+                    try:
+                        obj = json.loads(candidate)
+                    except Exception:
+                        break
+                    if isinstance(obj, dict) and required_key in obj:
+                        return obj
+                    break
+    return None
+
+
+async def _brave_search_results(query: str) -> list[dict[str, str]] | None:
+    key = os.getenv("BRAVE_API_KEY", "").strip()
+    if not key:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(25.0)) as client:
+            resp = await client.get(
+                "https://api.search.brave.com/res/v1/web/search",
+                params={"q": query, "count": 5},
+                headers={
+                    "X-Subscription-Token": key,
+                    "Accept": "application/json",
+                },
+            )
+            resp.raise_for_status()
+            data = resp.json()
+    except (httpx.HTTPError, ValueError, TypeError) as e:
+        logger.warning("Brave web search failed query=%r err=%s", query[:120], e)
+        return None
+
+    web = data.get("web") if isinstance(data, dict) else None
+    raw_list = web.get("results") if isinstance(web, dict) else None
+    if not isinstance(raw_list, list):
+        return None
+    out: list[dict[str, str]] = []
+    for item in raw_list:
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get("title") or "").strip()
+        url = str(item.get("url") or "").strip()
+        snippet = str(item.get("description") or item.get("snippet") or "").strip()
+        if not title and not snippet:
+            continue
+        out.append(
+            {
+                "title": (title or url or "Result")[:500],
+                "url": url[:2000],
+                "snippet": snippet[:1200],
+            }
+        )
+        if len(out) >= 5:
+            break
+    return out or None
+
+
+async def _duckduckgo_search_results(query: str) -> list[dict[str, str]]:
+    out: list[dict[str, str]] = []
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(20.0)) as client:
+            resp = await client.get(
+                "https://api.duckduckgo.com/",
+                params={"q": query, "format": "json", "no_redirect": "1", "no_html": "1"},
+            )
+            resp.raise_for_status()
+            j = resp.json()
+    except (httpx.HTTPError, ValueError, TypeError) as e:
+        logger.warning("DuckDuckGo search failed query=%r err=%s", query[:120], e)
+        return [{"title": "error", "url": "", "snippet": str(e)[:500]}]
+
+    if not isinstance(j, dict):
+        return out
+
+    ab = str(j.get("AbstractText") or "").strip()
+    if ab:
+        out.append(
+            {
+                "title": str(j.get("Heading") or "Instant answer")[:500],
+                "url": str(j.get("AbstractURL") or "")[:2000],
+                "snippet": ab[:1200],
+            }
+        )
+
+    def _from_topic(rt: dict[str, Any]) -> None:
+        text = str(rt.get("Text") or "").strip()
+        url = str(rt.get("FirstURL") or "").strip()
+        if text:
+            out.append({"title": text[:500], "url": url[:2000], "snippet": text[:1200]})
+
+    for rt in j.get("RelatedTopics") or []:
+        if isinstance(rt, dict):
+            if rt.get("Text"):
+                _from_topic(rt)
+            elif isinstance(rt.get("Topics"), list):
+                for sub in rt["Topics"][:5]:
+                    if isinstance(sub, dict):
+                        _from_topic(sub)
+        if len(out) >= 5:
+            break
+
+    return out[:5] if out else [{"title": "No results", "url": "", "snippet": "DuckDuckGo returned no text hits."}]
+
+
+async def _web_search_for_tool(query: str) -> dict[str, Any]:
+    q = (query or "").strip()
+    if not q:
+        return {"provider": "none", "results": [], "error": "empty_query"}
+    brave = await _brave_search_results(q)
+    if brave:
+        return {"provider": "brave", "results": brave}
+    ddg = await _duckduckgo_search_results(q)
+    return {"provider": "duckduckgo", "results": ddg}
+
+
+async def _anthropic_post_messages(
+    *,
+    model: str,
+    system: str,
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]] | None,
+    max_tokens: int,
+    tool_choice: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    key = os.getenv("ANTHROPIC_API_KEY", "").strip()
+    if not key:
+        return None
+    payload: dict[str, Any] = {
+        "model": model,
+        "max_tokens": max_tokens,
+        "system": system,
+        "messages": messages,
+    }
+    if tools is not None:
+        payload["tools"] = tools
+    if tool_choice is not None:
+        payload["tool_choice"] = tool_choice
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(120.0)) as client:
+            resp = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": key,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+                json=payload,
+            )
+            resp.raise_for_status()
+            return resp.json()
+    except httpx.HTTPStatusError as e:
+        body = (e.response.text or "")[:800]
+        logger.warning("Anthropic messages HTTP status=%s body=%s", e.response.status_code, body)
+        return None
+    except (httpx.HTTPError, ValueError, json.JSONDecodeError) as e:
+        logger.warning("Anthropic messages failed: %s", e)
+        return None
+
+
+async def _run_daily_pick_tool(
+    name: str,
+    tool_input: dict[str, Any],
+    *,
+    k: KalshiClient,
+    bound_ticker: str,
+    bound_title: str,
+    tool_state: dict[str, Any],
+    tool_log: list[dict[str, Any]],
+) -> Any:
+    if name == "web_search":
+        q = str(tool_input.get("query") or "").strip()
+        payload = await _web_search_for_tool(q)
+        tool_state["web_search_used"] = True
+        for r in payload.get("results") or []:
+            if isinstance(r, dict) and r.get("title"):
+                tool_state.setdefault("web_headlines", []).append(
+                    {
+                        "title": str(r.get("title") or "")[:500],
+                        "source": str(payload.get("provider") or "web"),
+                        "url": str(r.get("url") or "")[:2000],
+                    }
+                )
+        tool_log.append({"name": name, "input": {"query": q}, "result_preview": str(payload)[:2000]})
+        return payload
+
+    if name == "get_kalshi_market":
+        t = str(tool_input.get("ticker") or bound_ticker).strip()
+        try:
+            data = await k.get_market(t)
+        except httpx.HTTPError as e:
+            tool_log.append({"name": name, "input": {"ticker": t}, "error": str(e)})
+            return {"error": str(e), "ticker": t}
+        m = data.get("market") if isinstance(data, dict) else None
+        if not isinstance(m, dict):
+            m = data if isinstance(data, dict) else {}
+        s = summarize_market(m)
+        tool_state["kalshi_market_snapshot"] = s
+        out = {
+            "ticker": t,
+            "yes_bid": s.get("yes_bid"),
+            "yes_ask": s.get("yes_ask"),
+            "mid_probability": s.get("mid_prob"),
+            "volume": s.get("volume"),
+            "spread": s.get("spread"),
+            "close_time": s.get("close_time"),
+        }
+        tool_log.append({"name": name, "input": {"ticker": t}, "result_preview": json.dumps(out)[:1500]})
+        return out
+
+    if name == "get_kalshi_price_history":
+        t = str(tool_input.get("ticker") or bound_ticker).strip()
+        m: dict[str, Any] = {"ticker": t}
+        try:
+            data = await k.get_market(t)
+        except httpx.HTTPError:
+            data = {}
+        if isinstance(data, dict):
+            inner = data.get("market")
+            if isinstance(inner, dict):
+                m = inner
+            elif data.get("ticker"):
+                m = data
+        sentence, ok = await fetch_kalshi_seven_day_trend_sentence(k, m)
+        tool_state["price_trend_summary"] = sentence
+        tool_state["price_trend_ok"] = ok
+        tool_log.append({"name": name, "input": {"ticker": t}, "result_preview": sentence[:1500]})
+        return {"ticker": t, "trend_summary": sentence, "derived_from_history": ok}
+
+    if name == "get_economic_data":
+        block = await fetch_fred_economic_context()
+        tool_state["fred_macro"] = block
+        tool_log.append({"name": name, "input": {}, "result_preview": str(block.get("paragraph") or "")[:1500]})
+        return block
+
+    if name == "get_bls_release_data":
+        block = await _economic_release_data_block(bound_ticker, bound_title)
+        tool_state["bls_release"] = block
+        tool_log.append({"name": name, "input": {}, "result_preview": str(block.get("paragraph") or "")[:1500]})
+        return block
+
+    tool_log.append({"name": name, "error": "unknown_tool"})
+    return {"error": f"unknown_tool:{name}"}
+
+
+async def _daily_pick_agentic_loop(
+    *,
+    model_id: str,
+    initial_user: str,
+    k: KalshiClient,
+    bound_ticker: str,
+    bound_title: str,
+    max_tool_rounds: int = 5,
+) -> tuple[str | None, list[str], dict[str, Any]]:
+    """
+    Run Anthropic messages with tools. Up to `max_tool_rounds` rounds where the assistant
+    requests tools; after that, `tool_choice: none` forces a text-only JSON answer.
+    Returns (final assistant text, ordered source tags, diagnostics dict).
+    """
+    messages: list[dict[str, Any]] = [{"role": "user", "content": initial_user}]
+    source_tags_ordered: list[str] = []
+    seen: set[str] = set()
+    tool_state: dict[str, Any] = {"web_search_used": False, "web_headlines": []}
+    tool_log: list[dict[str, Any]] = []
+    tool_rounds = 0
+    final_text: str | None = None
+    web_nudge_count = 0
+    final_json_nudge_count = 0
+    safety = 0
+
+    def _note_tag(tool_name: str) -> None:
+        tag = TOOL_SOURCE_TAGS.get(tool_name)
+        if tag and tag not in seen:
+            seen.add(tag)
+            source_tags_ordered.append(tag)
+
+    while safety < 24:
+        safety += 1
+        allow_tools = tool_rounds < max_tool_rounds
+        tool_choice: dict[str, Any] | None = None if allow_tools else {"type": "none"}
+        logger.info(
+            "Daily pick Claude loop tick=%d tool_rounds=%d allow_tools=%s tool_choice=%s",
+            safety,
+            tool_rounds,
+            allow_tools,
+            tool_choice.get("type") if isinstance(tool_choice, dict) else "auto",
+        )
+
+        data = await _anthropic_post_messages(
+            model=model_id,
+            system=DAILY_PICK_SYSTEM_PROMPT,
+            messages=messages,
+            tools=DAILY_PICK_TOOLS,
+            max_tokens=4096,
+            tool_choice=tool_choice,
+        )
+        if not isinstance(data, dict):
+            break
+
+        stop_reason = str(data.get("stop_reason") or "")
+        content = data.get("content")
+        if not isinstance(content, list):
+            logger.warning("Daily pick Claude loop terminating: non-list content")
+            break
+
+        text_here = _extract_text_blocks(content)
+        logger.info(
+            "Daily pick Claude loop stop_reason=%s text_len=%d tool_blocks=%d",
+            stop_reason,
+            len(text_here or ""),
+            sum(1 for b in content if isinstance(b, dict) and b.get("type") == "tool_use"),
+        )
+
+        if stop_reason == "end_turn":
+            if text_here:
+                final_text = text_here
+            elif final_json_nudge_count < 2:
+                final_json_nudge_count += 1
+                logger.warning(
+                    "Daily pick Claude produced end_turn with empty text; requesting explicit final JSON (attempt %d)",
+                    final_json_nudge_count,
+                )
+                messages.append({"role": "assistant", "content": content})
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "Return your final answer now as a single JSON object only with keys "
+                            "model_yes_probability, confidence_score, reasoning, recommended_action, edge. "
+                            "Do not call tools and do not include any extra text."
+                        ),
+                    }
+                )
+                continue
+            if (
+                not tool_state.get("web_search_used")
+                and web_nudge_count < 2
+                and allow_tools
+            ):
+                web_nudge_count += 1
+                messages.append({"role": "assistant", "content": content})
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "You have not yet called the web_search tool, or we could not detect a successful "
+                            "web_search call. Call web_search now with at least one query clearly relevant to this "
+                            "Kalshi market (recent news or facts). After reviewing results, respond with ONLY the "
+                            "final JSON object."
+                        ),
+                    }
+                )
+                continue
+            break
+
+        if stop_reason != "tool_use":
+            if text_here:
+                final_text = text_here
+            logger.warning("Daily pick Claude loop terminating: stop_reason=%s", stop_reason)
+            break
+
+        if not allow_tools:
+            if text_here:
+                final_text = text_here
+            logger.warning("Daily pick Claude loop got tool_use when tools disabled")
+            break
+
+        messages.append({"role": "assistant", "content": content})
+        tool_blocks: list[dict[str, Any]] = []
+        for block in content:
+            if not isinstance(block, dict) or block.get("type") != "tool_use":
+                continue
+            tid = str(block.get("id") or "")
+            tname = str(block.get("name") or "")
+            raw_inp = block.get("input")
+            inp: dict[str, Any] = raw_inp if isinstance(raw_inp, dict) else {}
+            result = await _run_daily_pick_tool(
+                tname,
+                inp,
+                k=k,
+                bound_ticker=bound_ticker,
+                bound_title=bound_title,
+                tool_state=tool_state,
+                tool_log=tool_log,
+            )
+            _note_tag(tname)
+            tool_blocks.append(
+                {
+                    "type": "tool_result",
+                    "tool_use_id": tid,
+                    "content": json.dumps(result, default=str),
+                }
+            )
+
+        if not tool_blocks:
+            if text_here:
+                final_text = text_here
+            logger.warning("Daily pick Claude loop terminating: stop_reason=tool_use but no tool blocks")
+            break
+
+        user_tool_payload: list[dict[str, Any]] = list(tool_blocks)
+        if not tool_state.get("web_search_used") and tool_rounds == max_tool_rounds - 2:
+            user_tool_payload.append(
+                {
+                    "type": "text",
+                    "text": (
+                        "Reminder: you must call the web_search tool at least once with a query relevant to this "
+                        "market before you output the final JSON answer."
+                    ),
+                }
+            )
+        messages.append({"role": "user", "content": user_tool_payload})
+        tool_rounds += 1
+
+    if not tool_state.get("web_search_used"):
+        logger.warning(
+            "Daily pick Claude finished without a successful web_search tool call ticker=%s",
+            bound_ticker,
+        )
+
+    diag = {
+        "tool_rounds": tool_rounds,
+        "tool_log": tool_log,
+        "tool_state": dict(tool_state),
+    }
+    return final_text, source_tags_ordered, diag
+
+
 async def enrich_daily_pick_with_claude(
     baseline: dict[str, Any],
     market: dict[str, Any],
     *,
-    structured_briefing: str,
-) -> tuple[dict[str, Any] | None, str | None]:
+    k: KalshiClient,
+    historical_lines: list[str] | None = None,
+) -> tuple[dict[str, Any] | None, str | None, list[str]]:
     """
-    Run daily-pick analyst prompt; returns merged analysis dict and raw Claude text.
-    Uses claude-sonnet-4-6 unless ANTHROPIC_MODEL_DAILY_PICK is set (never Haiku by default).
+    Run daily-pick analyst with tool use; returns merged analysis, raw final text, and context source tags.
     """
     if not os.getenv("ANTHROPIC_API_KEY", "").strip():
         logger.warning("Daily pick Claude skipped: ANTHROPIC_API_KEY is not configured")
-        return None, None
+        logger.info("enrich_daily_pick_with_claude returning None: missing_anthropic_api_key")
+        return None, None, []
 
     model_id = os.getenv("ANTHROPIC_MODEL_DAILY_PICK", "").strip() or DAILY_PICK_MODEL_DEFAULT
     title = str(market.get("title") or market.get("subtitle") or baseline.get("title") or "")
     ticker = str(market.get("ticker") or baseline.get("ticker") or "")
     implied = float(baseline.get("implied_yes_probability") or 0.0)
 
-    user = build_daily_pick_user_prompt(
+    user = build_agentic_daily_pick_user_message(
         ticker=ticker,
         title=title,
         implied_decimal=implied,
-        structured_briefing=structured_briefing,
+        historical_lines=historical_lines,
     )
-    try:
-        text = await _anthropic_messages_json(
-            system=DAILY_PICK_SYSTEM_PROMPT,
-            user=user,
-            max_tokens=900,
-            model=model_id,
-        )
-    except Exception as e:
-        logger.warning("Daily pick Claude call failed unexpectedly: %s", e)
-        return None, None
+
+    text, source_tags, diag = await _daily_pick_agentic_loop(
+        model_id=model_id,
+        initial_user=user,
+        k=k,
+        bound_ticker=ticker,
+        bound_title=title,
+        max_tool_rounds=5,
+    )
+    logger.info("Claude raw final response: %s", (text[:500] if text else "NONE"))
+
     if not text:
-        logger.warning("Daily pick Claude returned no content; falling back to baseline")
-        return None, None
+        logger.warning("Daily pick Claude returned no final text; falling back to baseline")
+        logger.info("enrich_daily_pick_with_claude returning None: empty_final_text")
+        return None, None, source_tags
 
-    obj = _extract_json_object(text)
+    obj = _extract_json_with_key(text, required_key="model_yes_probability")
     if not obj:
-        return None, text
+        logger.warning("Daily pick Claude JSON extraction failed from final text")
+        logger.info("enrich_daily_pick_with_claude returning None: json_extraction_failed")
+        return None, text, source_tags
+    logger.info("Daily pick Claude JSON extraction succeeded keys=%s", sorted(obj.keys()))
 
-    parsed = parse_daily_pick_claude_json(obj, implied_decimal=implied)
+    try:
+        parsed = parse_daily_pick_claude_json(obj, implied_decimal=implied)
+    except Exception:
+        logger.exception("Daily pick Claude parse_daily_pick_claude_json threw exception")
+        logger.info("enrich_daily_pick_with_claude returning None: parse_exception")
+        return None, text, source_tags
     if not parsed:
-        return None, text
+        logger.warning("Daily pick Claude JSON parse returned None")
+        logger.info("enrich_daily_pick_with_claude returning None: parsed_none")
+        return None, text, source_tags
 
-    parsed = apply_daily_pick_pass_rules(parsed)
+    try:
+        parsed = apply_daily_pick_pass_rules(parsed)
+    except Exception:
+        logger.exception("Daily pick Claude apply_daily_pick_pass_rules threw exception")
+        logger.info("enrich_daily_pick_with_claude returning None: pass_rules_exception")
+        return None, text, source_tags
+    logger.info(
+        "Daily pick Claude parse+rules succeeded model_yes=%.4f edge=%.4f action=%s confidence=%s",
+        float(parsed.get("model_yes_probability") or 0.0),
+        float(parsed.get("edge") or 0.0),
+        str(parsed.get("recommended_action") or ""),
+        str(parsed.get("confidence_score") or ""),
+    )
     my = parsed["model_yes_probability"]
     cs = parsed["confidence_score"]
     edge = parsed["edge"]
@@ -241,9 +816,28 @@ async def enrich_daily_pick_with_claude(
     out["rationale"] = reasoning
     out["reasoning"] = reasoning
     out["recommended_action"] = ra
-    out["source"] = "claude_daily_pick_analyst"
+    out["source"] = "claude_daily_pick_analyst_agentic"
+
+    full_state = diag.get("tool_state") if isinstance(diag, dict) else {}
+    if isinstance(full_state, dict):
+        if full_state.get("fred_macro") is not None:
+            out["fred_macro"] = full_state["fred_macro"]
+        if full_state.get("bls_release") is not None:
+            out["bls_release"] = full_state["bls_release"]
+        if full_state.get("price_trend_summary"):
+            out["price_trend_summary"] = full_state["price_trend_summary"]
+        wh = full_state.get("web_headlines")
+        if isinstance(wh, list) and wh:
+            out["claude_research_headlines"] = wh[:15]
+
     out["claude"] = {
         "model": model_id,
         "raw_response": text[:12000],
+        "agentic": True,
+        "tool_rounds": diag.get("tool_rounds"),
+        "tool_log": diag.get("tool_log"),
+        "web_search_used": bool((diag.get("tool_state") or {}).get("web_search_used"))
+        if isinstance(diag.get("tool_state"), dict)
+        else False,
     }
-    return out, text
+    return out, text, source_tags
