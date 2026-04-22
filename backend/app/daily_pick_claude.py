@@ -356,51 +356,86 @@ async def _brave_search_results(query: str) -> list[dict[str, str]] | None:
     return out or None
 
 
-async def _duckduckgo_search_results(query: str) -> list[dict[str, str]]:
-    out: list[dict[str, str]] = []
+async def _serper_search_results(query: str) -> list[dict[str, str]] | None:
+    key = os.getenv("SERPER_API_KEY", "").strip()
+    if not key:
+        return None
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(20.0)) as client:
-            resp = await client.get(
-                "https://api.duckduckgo.com/",
-                params={"q": query, "format": "json", "no_redirect": "1", "no_html": "1"},
+        async with httpx.AsyncClient(timeout=httpx.Timeout(25.0)) as client:
+            resp = await client.post(
+                "https://google.serper.dev/search",
+                headers={
+                    "X-API-KEY": key,
+                    "content-type": "application/json",
+                },
+                json={"q": query, "num": 5},
             )
             resp.raise_for_status()
-            j = resp.json()
+            data = resp.json()
     except (httpx.HTTPError, ValueError, TypeError) as e:
-        logger.warning("DuckDuckGo search failed query=%r err=%s", query[:120], e)
-        return [{"title": "error", "url": "", "snippet": str(e)[:500]}]
-
-    if not isinstance(j, dict):
-        return out
-
-    ab = str(j.get("AbstractText") or "").strip()
-    if ab:
+        logger.warning("Serper search failed query=%r err=%s", query[:120], e)
+        return None
+    organic = data.get("organic") if isinstance(data, dict) else None
+    if not isinstance(organic, list):
+        return None
+    out: list[dict[str, str]] = []
+    for item in organic:
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get("title") or "").strip()
+        url = str(item.get("link") or "").strip()
+        snippet = str(item.get("snippet") or "").strip()
+        if not title and not snippet:
+            continue
         out.append(
             {
-                "title": str(j.get("Heading") or "Instant answer")[:500],
-                "url": str(j.get("AbstractURL") or "")[:2000],
-                "snippet": ab[:1200],
+                "title": (title or url or "Result")[:500],
+                "url": url[:2000],
+                "snippet": snippet[:1200],
             }
         )
-
-    def _from_topic(rt: dict[str, Any]) -> None:
-        text = str(rt.get("Text") or "").strip()
-        url = str(rt.get("FirstURL") or "").strip()
-        if text:
-            out.append({"title": text[:500], "url": url[:2000], "snippet": text[:1200]})
-
-    for rt in j.get("RelatedTopics") or []:
-        if isinstance(rt, dict):
-            if rt.get("Text"):
-                _from_topic(rt)
-            elif isinstance(rt.get("Topics"), list):
-                for sub in rt["Topics"][:5]:
-                    if isinstance(sub, dict):
-                        _from_topic(sub)
         if len(out) >= 5:
             break
+    return out or None
 
-    return out[:5] if out else [{"title": "No results", "url": "", "snippet": "DuckDuckGo returned no text hits."}]
+
+async def _tavily_search_results(query: str) -> list[dict[str, str]] | None:
+    key = os.getenv("TAVILY_API_KEY", "").strip()
+    if not key:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(25.0)) as client:
+            resp = await client.post(
+                "https://api.tavily.com/search",
+                json={"api_key": key, "query": query, "max_results": 5},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+    except (httpx.HTTPError, ValueError, TypeError) as e:
+        logger.warning("Tavily search failed query=%r err=%s", query[:120], e)
+        return None
+    raw = data.get("results") if isinstance(data, dict) else None
+    if not isinstance(raw, list):
+        return None
+    out: list[dict[str, str]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get("title") or "").strip()
+        url = str(item.get("url") or "").strip()
+        snippet = str(item.get("content") or "").strip()
+        if not title and not snippet:
+            continue
+        out.append(
+            {
+                "title": (title or url or "Result")[:500],
+                "url": url[:2000],
+                "snippet": snippet[:1200],
+            }
+        )
+        if len(out) >= 5:
+            break
+    return out or None
 
 
 async def _web_search_for_tool(query: str) -> dict[str, Any]:
@@ -410,8 +445,17 @@ async def _web_search_for_tool(query: str) -> dict[str, Any]:
     brave = await _brave_search_results(q)
     if brave:
         return {"provider": "brave", "results": brave}
-    ddg = await _duckduckgo_search_results(q)
-    return {"provider": "duckduckgo", "results": ddg}
+    serper = await _serper_search_results(q)
+    if serper:
+        return {"provider": "serper", "results": serper}
+    tavily = await _tavily_search_results(q)
+    if tavily:
+        return {"provider": "tavily", "results": tavily}
+    logger.warning(
+        "web_search tool returned empty results: no provider configured or all provider calls failed "
+        "(set BRAVE_API_KEY, SERPER_API_KEY, or TAVILY_API_KEY)"
+    )
+    return {"provider": "none", "results": [], "error": "no_search_provider_configured_or_available"}
 
 
 async def _anthropic_post_messages(
