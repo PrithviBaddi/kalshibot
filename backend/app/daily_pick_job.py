@@ -10,6 +10,7 @@ from __future__ import annotations
 import calendar
 import logging
 import os
+import re
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -34,6 +35,10 @@ _TOP_CANDIDATES_TO_EVALUATE = 5
 _MIN_MID_PROB = 0.15
 _MAX_MID_PROB = 0.85
 _SPORTS_TERMS = ("sport", "nba", "nfl", "mlb", "nhl", "soccer", "ncaa", "tennis", "golf", "mma", "ufc")
+_NARROW_BAND_TITLE_RE = re.compile(r"\bbetween\s+\d+(?:\.\d+)?\s+and\s+\d+(?:\.\d+)?\b", re.IGNORECASE)
+_NARROW_BAND_TICKER_RE = re.compile(r"H\d{4}")
+_EXCLUDED_PREFIXES = ("KXSP500ADD", "KXSP500REMOVE")
+_FINANCIALS_PRIORITY_PREFIXES = ("KXFED", "KXTERMINALRATE", "KXCOIN", "KXBTC", "KXOIL")
 
 # UTC weekday: Mon=0 … Sun=6. Sun runs a 3-way tournament (highest pool score wins).
 _WEEKDAY_TO_CATEGORY: dict[int, str] = {
@@ -98,12 +103,31 @@ def _resolves_within_days(m: dict[str, Any], days: int) -> bool:
     return now <= close <= (now + timedelta(days=days))
 
 
-def _filter_candidates(markets: list[dict[str, Any]], *, max_spread: float) -> list[dict[str, Any]]:
+def _is_excluded_narrow_band_or_committee_market(m: dict[str, Any]) -> bool:
+    ticker = str(m.get("ticker") or "").upper().strip()
+    title = str(m.get("title") or "")
+    if ticker.startswith(_EXCLUDED_PREFIXES):
+        return True
+    if _NARROW_BAND_TICKER_RE.search(ticker):
+        return True
+    if _NARROW_BAND_TITLE_RE.search(title):
+        return True
+    return False
+
+
+def _financials_priority_boost(m: dict[str, Any]) -> int:
+    ticker = str(m.get("ticker") or "").upper().strip()
+    return 1 if ticker.startswith(_FINANCIALS_PRIORITY_PREFIXES) else 0
+
+
+def _filter_candidates(markets: list[dict[str, Any]], *, max_spread: float, pick_category: str = "") -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for m in markets:
         if not _is_binary_non_combo(m):
             continue
         if not _is_non_sports(m):
+            continue
+        if _is_excluded_narrow_band_or_committee_market(m):
             continue
         if not _resolves_within_days(m, _MAX_DAYS_TO_RESOLVE):
             continue
@@ -115,8 +139,20 @@ def _filter_candidates(markets: list[dict[str, Any]], *, max_spread: float) -> l
             continue
         if float(s.get("spread") or 1.0) >= max_spread:
             continue
-        rows.append({"market": m, "scan": s})
-    rows.sort(key=lambda x: (float(x["scan"].get("score") or 0), float(x["scan"].get("volume") or 0)), reverse=True)
+        rows.append({"market": m, "scan": s, "priority_boost": _financials_priority_boost(m)})
+
+    cat = (pick_category or "").strip().lower()
+    if cat == "financials":
+        rows.sort(
+            key=lambda x: (
+                int(x.get("priority_boost") or 0),
+                float(x["scan"].get("score") or 0),
+                float(x["scan"].get("volume") or 0),
+            ),
+            reverse=True,
+        )
+    else:
+        rows.sort(key=lambda x: (float(x["scan"].get("score") or 0), float(x["scan"].get("volume") or 0)), reverse=True)
     return rows
 
 
@@ -141,7 +177,7 @@ async def _gather_filtered_for_category(
         all_markets.extend(d.get("markets") or [])
 
     markets = dedupe_markets_by_ticker(all_markets)
-    filtered = _filter_candidates(markets, max_spread=_MAX_SPREAD)
+    filtered = _filter_candidates(markets, max_spread=_MAX_SPREAD, pick_category=category)
     spread_relaxed = False
     if len(filtered) < _MIN_FILTERED_BEFORE_SPREAD_RELAX:
         logger.warning(
@@ -151,7 +187,7 @@ async def _gather_filtered_for_category(
             _MAX_SPREAD,
             _MAX_SPREAD_RELAXED,
         )
-        filtered = _filter_candidates(markets, max_spread=_MAX_SPREAD_RELAXED)
+        filtered = _filter_candidates(markets, max_spread=_MAX_SPREAD_RELAXED, pick_category=category)
         spread_relaxed = True
     return filtered, spread_relaxed, len(markets)
 

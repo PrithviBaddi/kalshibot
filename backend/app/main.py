@@ -215,6 +215,12 @@ async def lifespan(app: FastAPI):
         init_db()
         init_strategy_from_db()
         logger.info("ANTHROPIC_API_KEY configured: %s", bool(os.getenv("ANTHROPIC_API_KEY", "").strip()))
+        logger.info(
+            "Search provider: BRAVE=%s SERPER=%s TAVILY=%s",
+            bool(os.getenv("BRAVE_API_KEY", "").strip()),
+            bool(os.getenv("SERPER_API_KEY", "").strip()),
+            bool(os.getenv("TAVILY_API_KEY", "").strip()),
+        )
         if user_auth_enabled() and not jwt_secret():
             logger.warning(
                 "KALSHIBOT_USER_AUTH is set but JWT_SECRET is empty — set JWT_SECRET or disable USER_AUTH."
