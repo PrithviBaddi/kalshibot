@@ -311,6 +311,13 @@ def _extract_json_with_key(raw_text: str, required_key: str = "model_yes_probabi
     return None
 
 
+def _html_to_plain_text(html: str) -> str:
+    s = re.sub(r"(?is)<(script|style).*?>.*?</\1>", " ", html or "")
+    s = re.sub(r"(?is)<[^>]+>", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
 async def _brave_search_results(query: str) -> list[dict[str, str]] | None:
     key = os.getenv("BRAVE_API_KEY", "").strip()
     if not key:
@@ -396,6 +403,20 @@ async def _serper_search_results(query: str) -> list[dict[str, str]] | None:
         )
         if len(out) >= 5:
             break
+    if out:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(5.0)) as client:
+            for i, item in enumerate(out[:2]):
+                url = str(item.get("url") or "").strip()
+                if not url:
+                    continue
+                try:
+                    resp = await client.get(url, follow_redirects=True)
+                    resp.raise_for_status()
+                    plain = _html_to_plain_text(resp.text or "")
+                    if plain:
+                        item["full_text"] = plain[:500]
+                except Exception as e:
+                    logger.info("Serper full-text fetch skipped url=%r err=%s", url[:240], e)
     return out or None
 
 

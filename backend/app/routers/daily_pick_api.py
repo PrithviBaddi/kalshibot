@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field, model_validator
 
 from app.api_auth import get_api_token
 from app.daily_pick_job import run_daily_pick_generation
+from app.daily_pick_resolution import run_daily_pick_resolution_check
 from app.db import (
     _utc_day_string,
     delete_global_daily_pick,
@@ -20,6 +21,7 @@ from app.db import (
 )
 from app.feature_flags import jwt_secret, user_auth_enabled
 from app.jwt_tokens import decode_access_token
+from kalshi.client import KalshiClient
 
 router = APIRouter(prefix="/api/v1/daily-picks", tags=["daily-picks"])
 
@@ -176,6 +178,36 @@ async def resolve_daily_pick(request: Request, body: ResolveDailyPickBody) -> di
     if not updated:
         raise HTTPException(status_code=404, detail=f"No daily pick stored for day {day}.")
     return {"ok": True, "day": day, "resolved": body.resolved, "resolution_correct": body.resolution_correct}
+
+
+@router.post("/check-resolutions")
+async def check_daily_pick_resolutions(request: Request) -> dict[str, Any]:
+    """Operator/admin: run resolution checker immediately once."""
+    _require_admin_bearer(request)
+    try:
+        k = KalshiClient()
+    except ValueError as e:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Kalshi client is not configured on the server. "
+                "Set KALSHI_API_KEY_ID and KALSHI_PRIVATE_KEY_PATH (or KALSHI_PRIVATE_KEY)."
+            ),
+        ) from e
+    try:
+        summary = await run_daily_pick_resolution_check(k)
+    finally:
+        await k.aclose()
+    updated_days = summary.get("updated") if isinstance(summary.get("updated"), list) else []
+    errors = summary.get("errors") if isinstance(summary.get("errors"), list) else []
+    return {
+        "ok": True,
+        "checked": int(summary.get("checked") or 0),
+        "newly_resolved": len(updated_days),
+        "updated_days": updated_days,
+        "skipped": int(summary.get("skipped") or 0),
+        "errors": errors,
+    }
 
 
 @router.get("/accuracy")
