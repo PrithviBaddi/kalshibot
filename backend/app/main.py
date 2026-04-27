@@ -216,6 +216,11 @@ async def lifespan(app: FastAPI):
         init_strategy_from_db()
         logger.info("ANTHROPIC_API_KEY configured: %s", bool(os.getenv("ANTHROPIC_API_KEY", "").strip()))
         logger.info(
+            "Daily pick window: MIN=%s days MAX=%s days",
+            os.getenv("DAILY_PICK_MIN_DAYS", "2"),
+            os.getenv("DAILY_PICK_MAX_DAYS", "90"),
+        )
+        logger.info(
             "Search provider: BRAVE=%s SERPER=%s TAVILY=%s",
             bool(os.getenv("BRAVE_API_KEY", "").strip()),
             bool(os.getenv("SERPER_API_KEY", "").strip()),

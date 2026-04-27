@@ -29,8 +29,9 @@ logger = logging.getLogger(__name__)
 _MIN_VOLUME = 1000.0
 _MAX_SPREAD = 0.08
 _MAX_SPREAD_RELAXED = 0.15
-_MIN_FILTERED_BEFORE_SPREAD_RELAX = 3
-_MAX_DAYS_TO_RESOLVE = 90
+_MIN_VOLUME_RELAXED = 500.0
+_MAX_DAYS_TO_RESOLVE = int(os.getenv("DAILY_PICK_MAX_DAYS", "90"))
+_MIN_DAYS_TO_RESOLVE = int(os.getenv("DAILY_PICK_MIN_DAYS", "2"))
 _TOP_CANDIDATES_TO_EVALUATE = 5
 _MIN_MID_PROB = 0.15
 _MAX_MID_PROB = 0.85
@@ -95,12 +96,14 @@ def _is_binary_non_combo(m: dict[str, Any]) -> bool:
     return True
 
 
-def _resolves_within_days(m: dict[str, Any], days: int) -> bool:
+def _resolves_within_days(m: dict[str, Any], *, min_days: int, max_days: int) -> bool:
     now = datetime.now(timezone.utc)
     close = _to_dt(m.get("close_time") or m.get("expiration_time") or m.get("end_date"))
     if close is None:
         return False
-    return now <= close <= (now + timedelta(days=days))
+    min_delta = timedelta(days=max(0, min_days))
+    max_delta = timedelta(days=max(min_days, max_days))
+    return (now + min_delta) <= close <= (now + max_delta)
 
 
 def _is_excluded_narrow_band_or_committee_market(m: dict[str, Any]) -> bool:
@@ -120,7 +123,15 @@ def _financials_priority_boost(m: dict[str, Any]) -> int:
     return 1 if ticker.startswith(_FINANCIALS_PRIORITY_PREFIXES) else 0
 
 
-def _filter_candidates(markets: list[dict[str, Any]], *, max_spread: float, pick_category: str = "") -> list[dict[str, Any]]:
+def _filter_candidates(
+    markets: list[dict[str, Any]],
+    *,
+    max_spread: float,
+    min_volume: float,
+    min_days: int,
+    max_days: int,
+    pick_category: str = "",
+) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for m in markets:
         if not _is_binary_non_combo(m):
@@ -129,13 +140,13 @@ def _filter_candidates(markets: list[dict[str, Any]], *, max_spread: float, pick
             continue
         if _is_excluded_narrow_band_or_committee_market(m):
             continue
-        if not _resolves_within_days(m, _MAX_DAYS_TO_RESOLVE):
+        if not _resolves_within_days(m, min_days=min_days, max_days=max_days):
             continue
         s = summarize_market(m)
         mid = float(s.get("mid_prob") or 0.0)
         if mid < _MIN_MID_PROB or mid > _MAX_MID_PROB:
             continue
-        if float(s.get("volume") or 0) < _MIN_VOLUME:
+        if float(s.get("volume") or 0) < float(min_volume):
             continue
         if float(s.get("spread") or 1.0) >= max_spread:
             continue
@@ -159,10 +170,10 @@ def _filter_candidates(markets: list[dict[str, Any]], *, max_spread: float, pick
 async def _gather_filtered_for_category(
     k: KalshiClient,
     category: str,
-) -> tuple[list[dict[str, Any]], bool, int]:
+) -> tuple[list[dict[str, Any]], int]:
     """
-    Pull open markets for one Kalshi category, apply Step-2 filters, optionally relax spread.
-    Returns (filtered rows, spread_relaxed, deduped_market_count).
+    Pull open markets for one Kalshi category and apply Step-2 filters.
+    Returns (filtered rows, deduped_market_count).
     """
     ser = await k.get_series_list(category=category)
     series_list = ser.get("series") or []
@@ -177,19 +188,53 @@ async def _gather_filtered_for_category(
         all_markets.extend(d.get("markets") or [])
 
     markets = dedupe_markets_by_ticker(all_markets)
-    filtered = _filter_candidates(markets, max_spread=_MAX_SPREAD, pick_category=category)
-    spread_relaxed = False
-    if len(filtered) < _MIN_FILTERED_BEFORE_SPREAD_RELAX:
-        logger.warning(
-            "Daily pick %s: only %d candidates with max_spread=%.2f; relaxing max_spread to %.2f",
-            category,
-            len(filtered),
-            _MAX_SPREAD,
-            _MAX_SPREAD_RELAXED,
-        )
-        filtered = _filter_candidates(markets, max_spread=_MAX_SPREAD_RELAXED, pick_category=category)
-        spread_relaxed = True
-    return filtered, spread_relaxed, len(markets)
+    filtered = _filter_candidates(
+        markets,
+        max_spread=_MAX_SPREAD,
+        min_volume=_MIN_VOLUME,
+        min_days=_MIN_DAYS_TO_RESOLVE,
+        max_days=_MAX_DAYS_TO_RESOLVE,
+        pick_category=category,
+    )
+    return filtered, len(markets)
+
+
+async def _gather_filtered_for_categories(
+    k: KalshiClient,
+    categories: list[str],
+    *,
+    max_spread: float,
+    min_volume: float,
+) -> tuple[list[dict[str, Any]], int]:
+    merged: list[dict[str, Any]] = []
+    raw_total = 0
+    for cat in categories:
+        ser = await k.get_series_list(category=cat)
+        series_list = ser.get("series") or []
+        all_markets: list[dict[str, Any]] = []
+        max_series = int(os.getenv("DAILY_PICK_MAX_SERIES", "80"))
+        per_limit = int(os.getenv("DAILY_PICK_MARKETS_PER_SERIES", "100"))
+        for s in series_list[:max_series]:
+            st = s.get("ticker")
+            if not st:
+                continue
+            d = await k.get_markets(limit=per_limit, series_ticker=str(st), mve_filter="exclude")
+            all_markets.extend(d.get("markets") or [])
+        markets = dedupe_markets_by_ticker(all_markets)
+        raw_total += len(markets)
+        merged.extend(markets)
+
+    deduped = dedupe_markets_by_ticker(merged)
+    pick_cat = categories[0] if len(categories) == 1 else ""
+    filtered = _filter_candidates(
+        deduped,
+        max_spread=max_spread,
+        min_volume=min_volume,
+        min_days=_MIN_DAYS_TO_RESOLVE,
+        max_days=_MAX_DAYS_TO_RESOLVE,
+        pick_category=pick_cat,
+    )
+    return filtered, raw_total
 
 
 def _pool_quality_score(filtered: list[dict[str, Any]]) -> float:
@@ -211,20 +256,20 @@ async def _sunday_select_category_and_pool(
     best_key = (-1.0, -1)
 
     for cat in _SUNDAY_CATEGORIES:
-        filtered, spread_relaxed, raw_n = await _gather_filtered_for_category(k, cat)
+        filtered, raw_n = await _gather_filtered_for_category(k, cat)
         pq = _pool_quality_score(filtered) if filtered else -1.0
         meta["scores"][cat] = {
             "pool_quality_score": pq,
             "pool_size": len(filtered),
             "raw_markets": raw_n,
-            "spread_relaxed": spread_relaxed,
+            "spread_relaxed": False,
         }
         key = (pq, len(filtered))
         if filtered and key > best_key:
             best_key = key
             best_cat = cat
             best_filtered = filtered
-            best_relaxed = spread_relaxed
+            best_relaxed = False
 
     if not best_cat or not best_filtered:
         raise RuntimeError(
@@ -364,7 +409,12 @@ def _pick_best_result(results: list[dict[str, Any]]) -> dict[str, Any]:
 async def run_daily_pick_generation() -> dict[str, Any]:
     """
     Step 2 selection:
-    - Filter to binary, non-combo, non-sports, volume >= 1000, spread < 0.08 (or 0.15 fallback), resolve <= 90 days.
+    - Filter to binary, non-combo, non-sports, window between DAILY_PICK_MIN_DAYS and DAILY_PICK_MAX_DAYS.
+    - Candidate fallback chain:
+      1) primary spread/volume
+      2) relaxed spread
+      3) combined categories
+      4) relaxed volume
     - Score candidates by scanner quality, run Claude on top 5, choose largest actionable edge.
     """
     day = _utc_day_string()
@@ -387,39 +437,112 @@ async def run_daily_pick_generation() -> dict[str, Any]:
 
     try:
         rotation_meta: dict[str, Any]
+        base_categories: list[str]
         if forced:
             category = forced
+            base_categories = [category]
             rotation_meta = {
                 "mode": "env_override",
                 "category": category,
                 "note": "DAILY_PICK_CATEGORY overrides weekday rotation",
             }
-            filtered, spread_relaxed, _raw_n = await _gather_filtered_for_category(k, category)
             logger.info("Daily pick using env category=%s (override)", category)
+        elif _MAX_DAYS_TO_RESOLVE <= 14:
+            base_categories = list(_SUNDAY_CATEGORIES)
+            category = "Combined"
+            rotation_meta = {
+                "mode": "short_window_all_categories",
+                "max_days_to_resolve": _MAX_DAYS_TO_RESOLVE,
+                "categories": list(base_categories),
+            }
+            logger.info("Short window mode: scanning all categories simultaneously.")
         elif wd == 6:
             category, filtered, spread_relaxed, rotation_meta = await _sunday_select_category_and_pool(k)
+            base_categories = [category]
         else:
             category = _WEEKDAY_TO_CATEGORY[wd]
+            base_categories = [category]
             rotation_meta = {
                 "mode": "weekday_rotation",
                 "utc_weekday": calendar.day_name[wd],
                 "utc_weekday_index": wd,
                 "category": category,
             }
-            filtered, spread_relaxed, _raw_n = await _gather_filtered_for_category(k, category)
-            logger.info(
-                "Daily pick weekday rotation: %s → category=%s (pool_size=%d)",
-                calendar.day_name[wd],
-                category,
-                len(filtered),
-            )
+            logger.info("Daily pick weekday rotation: %s → category=%s", calendar.day_name[wd], category)
 
-        spread_used = _MAX_SPREAD_RELAXED if spread_relaxed else _MAX_SPREAD
-        spread_relaxed_fallback = spread_relaxed
+        filtered: list[dict[str, Any]] = []
+        spread_used = _MAX_SPREAD
+        spread_relaxed_fallback = False
+        min_volume_used = _MIN_VOLUME
+        tried_steps: list[str] = []
+
+        attempts: list[dict[str, Any]] = [
+            {
+                "name": "primary",
+                "categories": list(base_categories),
+                "max_spread": _MAX_SPREAD,
+                "min_volume": _MIN_VOLUME,
+            },
+            {
+                "name": "relax_spread",
+                "categories": list(base_categories),
+                "max_spread": _MAX_SPREAD_RELAXED,
+                "min_volume": _MIN_VOLUME,
+            },
+            {
+                "name": "combined_categories",
+                "categories": list(_SUNDAY_CATEGORIES),
+                "max_spread": _MAX_SPREAD_RELAXED,
+                "min_volume": _MIN_VOLUME,
+            },
+            {
+                "name": "relax_volume",
+                "categories": list(_SUNDAY_CATEGORIES),
+                "max_spread": _MAX_SPREAD_RELAXED,
+                "min_volume": _MIN_VOLUME_RELAXED,
+            },
+        ]
+
+        for idx, attempt in enumerate(attempts):
+            nm = str(attempt["name"])
+            cats = list(attempt["categories"])
+            mxs = float(attempt["max_spread"])
+            mnv = float(attempt["min_volume"])
+            if idx > 0:
+                logger.warning(
+                    "Daily pick fallback step=%s categories=%s max_spread=%.2f min_volume=%.0f",
+                    nm,
+                    ",".join(cats),
+                    mxs,
+                    mnv,
+                )
+            filtered, _raw_n = await _gather_filtered_for_categories(
+                k,
+                cats,
+                max_spread=mxs,
+                min_volume=mnv,
+            )
+            tried_steps.append(f"{nm}(cats={','.join(cats)} spread<={mxs:.2f} vol>={mnv:.0f}) -> {len(filtered)}")
+            if filtered:
+                spread_used = mxs
+                min_volume_used = mnv
+                spread_relaxed_fallback = mxs > _MAX_SPREAD
+                if len(cats) == 1:
+                    category = cats[0]
+                else:
+                    category = "Combined"
+                    rotation_meta = {
+                        **rotation_meta,
+                        "mode": "combined_categories",
+                        "categories": cats,
+                    }
+                break
 
         if not filtered:
             raise RuntimeError(
-                f"No markets passed Step-2 filters for {category} (binary/non-sports/volume/spread/<=90 days)."
+                "No markets passed Step-2 filters after fallbacks. "
+                f"Tried: {' | '.join(tried_steps)}. "
+                f"Window: min_days={_MIN_DAYS_TO_RESOLVE}, max_days={_MAX_DAYS_TO_RESOLVE}."
             )
 
         top = filtered[:_TOP_CANDIDATES_TO_EVALUATE]
@@ -467,6 +590,8 @@ async def run_daily_pick_generation() -> dict[str, Any]:
                 "reason": selected.get("selection_reason"),
                 "constraints": {
                     "min_volume": _MIN_VOLUME,
+                    "min_volume_used": min_volume_used,
+                    "min_days_to_resolve": _MIN_DAYS_TO_RESOLVE,
                     "max_spread": spread_used,
                     "max_spread_primary": _MAX_SPREAD,
                     "spread_relaxed_fallback": spread_relaxed_fallback,
