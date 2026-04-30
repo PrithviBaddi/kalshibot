@@ -63,7 +63,7 @@ def _require_admin_bearer(request: Request) -> None:
 
 
 def _require_user_jwt_not_api_token(request: Request) -> None:
-    """Pick history is for signed-in accounts (Free or Pro), not the shared admin API token."""
+    """Pick history access: user JWT (preferred) or shared admin API token."""
     if not user_auth_enabled():
         raise HTTPException(
             status_code=503,
@@ -78,10 +78,7 @@ def _require_user_jwt_not_api_token(request: Request) -> None:
         raise HTTPException(status_code=401, detail="Sign in to view pick history.")
     expected = get_api_token()
     if expected and bearer == expected:
-        raise HTTPException(
-            status_code=401,
-            detail="Use your user session (login JWT) for pick history, not the admin API token.",
-        )
+        return
     payload = decode_access_token(bearer)
     if not payload or not payload.get("sub"):
         raise HTTPException(status_code=401, detail="Invalid or expired session. Sign in again.")
