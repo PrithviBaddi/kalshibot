@@ -55,6 +55,9 @@ export function DailyPickCard({ pick, className }: DailyPickCardProps) {
           <h2 className="editorial-heading text-2xl sm:text-3xl lg:text-4xl text-foreground text-center max-w-3xl mx-auto mb-12 leading-tight">
             {pick.question}
           </h2>
+          <p className="mb-10 text-center font-mono text-xs text-muted-foreground">
+            Contract: {pick.ticker}
+          </p>
 
           {/* Probability comparison - the centerpiece */}
           <div className="flex flex-col lg:flex-row items-center justify-center gap-8 lg:gap-16 mb-12">

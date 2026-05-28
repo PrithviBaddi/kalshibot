@@ -22,8 +22,8 @@ export function PerformanceSummary({ stats }: PerformanceSummaryProps) {
       />
       <StatCard
         label="Accuracy"
-        value={`${stats.accuracy}%`}
-        subtext="On resolved predictions"
+        value={stats.accuracy === null ? '—' : `${stats.accuracy}%`}
+        subtext={`Based on ${stats.resolvedPicks} resolved directional predictions`}
         trend="up"
       />
       <StatCard

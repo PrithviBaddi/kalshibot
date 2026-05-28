@@ -26,10 +26,21 @@ function authHeaders(): Record<string, string> {
 }
 
 async function apiGet<T>(path: string): Promise<T> {
-  const r = await fetch(`${API_BASE}${path}`, {
-    headers: { 'content-type': 'application/json', ...authHeaders() },
-    cache: 'no-store',
-  });
+  let r: Response;
+  try {
+    r = await fetch(`${API_BASE}${path}`, {
+      headers: { 'content-type': 'application/json', ...authHeaders() },
+      cache: 'no-store',
+    });
+  } catch (e) {
+    const hint =
+      typeof window !== 'undefined'
+        ? ` Cannot reach API at ${API_BASE} (NEXT_PUBLIC_API_BASE). Is uvicorn running?`
+        : '';
+    throw new Error(
+      `${e instanceof Error ? e.message : 'Failed to fetch'}.${hint}`.trim(),
+    );
+  }
   if (!r.ok) {
     const body = await r.text().catch(() => '');
     throw new Error(`${r.status}: ${body || r.statusText}`);
@@ -39,7 +50,7 @@ async function apiGet<T>(path: string): Promise<T> {
 
 function toRec(value: unknown): RecommendationType {
   const s = String(value || 'PASS').toUpperCase().replace(/[- ]/g, '_');
-  if (s === 'BUY_YES' || s === 'BUY_NO' || s === 'PASS') return s;
+  if (s === 'BUY_YES' || s === 'BUY_NO' || s === 'PASS' || s === 'NO_SIGNAL') return s;
   return 'PASS';
 }
 
@@ -76,20 +87,26 @@ type HistoryResponse = {
     ticker: string;
     title: string;
     recommended_action: string | null;
+    reasoning?: string | null;
     resolved: boolean | null;
     resolution_correct: boolean | null;
+    invalid?: boolean | null;
+    invalid_reason?: string | null;
     market_implied_yes: number | null;
     model_yes_probability: number | null;
+    confidence_score?: number | null;
     edge: number | null;
+    context_sources_used?: string[] | null;
+    created_at?: number | null;
   }>;
 };
 
 type AccuracyResponse = {
   ok: boolean;
   total_picks?: number;
-  resolved_picks?: number;
-  accuracy_pct?: number;
-  current_streak?: number;
+  total_resolved?: number;
+  non_pass_resolved_count?: number;
+  accuracy_percent?: number | null;
 };
 
 export async function fetchTodayPick(): Promise<DailyPick | null> {
@@ -127,20 +144,52 @@ export async function fetchHistoryRows(): Promise<HistoryRow[]> {
     recommendation: toRec(r.recommended_action),
     resolved: r.resolved === true,
     correct: r.resolution_correct === null ? null : r.resolution_correct === true,
+    invalid: r.invalid === true,
+    invalidReason: r.invalid_reason ? String(r.invalid_reason) : null,
     kalshiProb: Math.round((Number(r.market_implied_yes || 0) || 0) * 100),
     modelProb: Math.round((Number(r.model_yes_probability || 0) || 0) * 100),
     edge: Math.round(Math.abs(Number(r.edge || 0)) * 100),
   }));
 }
 
+export async function fetchLatestPickFromHistory(): Promise<DailyPick | null> {
+  const d = await apiGet<HistoryResponse>('/api/v1/daily-picks/history');
+  const first = Array.isArray(d.picks) && d.picks.length > 0 ? d.picks[0] : null;
+  if (!first) return null;
+  const kalshiProb = Math.round((Number(first.market_implied_yes || 0) || 0) * 100);
+  const modelProb = Math.round((Number(first.model_yes_probability || 0) || 0) * 100);
+  return {
+    id: String(first.day || first.ticker),
+    date: String(first.day || new Date().toISOString().slice(0, 10)),
+    question: String(first.title || first.ticker),
+    ticker: String(first.ticker || ''),
+    category: 'Latest Pick',
+    kalshiProb,
+    modelProb,
+    recommendation: toRec(first.recommended_action),
+    confidence: Math.max(1, Math.min(100, Number(first.confidence_score || 50))),
+    reasoning: String(first.reasoning || 'Most recent stored recommendation from KalshiBot.'),
+    edge: Math.round(Math.abs(Number(first.edge || 0)) * 100),
+    source: 'KalshiBot AI',
+    sourcesUsed: Array.isArray(first.context_sources_used) ? first.context_sources_used : [],
+    updatedAt: relTimeFromUnix(first.created_at || null),
+  };
+}
+
 export async function fetchPerformanceStats(): Promise<PerformanceStats> {
   const d = await apiGet<AccuracyResponse>('/api/v1/daily-picks/accuracy');
-  const acc = Number(d.accuracy_pct || 0);
+  const accRaw = d.accuracy_percent;
+  const acc =
+    accRaw === null || accRaw === undefined
+      ? null
+      : Number.isFinite(Number(accRaw))
+        ? Number(Number(accRaw).toFixed(1))
+        : null;
   return {
     totalPicks: Number(d.total_picks || 0),
-    resolvedPicks: Number(d.resolved_picks || 0),
-    accuracy: Number.isFinite(acc) ? Number(acc.toFixed(1)) : 0,
-    currentStreak: Number(d.current_streak || 0),
+    resolvedPicks: Number(d.non_pass_resolved_count || 0),
+    accuracy: acc,
+    currentStreak: 0,
   };
 }
 

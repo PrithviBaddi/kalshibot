@@ -1,4 +1,4 @@
-export type RecommendationType = 'BUY_YES' | 'BUY_NO' | 'PASS';
+export type RecommendationType = 'BUY_YES' | 'BUY_NO' | 'PASS' | 'NO_SIGNAL';
 
 export interface DailyPick {
   id: string;
@@ -25,6 +25,8 @@ export interface HistoryRow {
   recommendation: RecommendationType;
   resolved: boolean;
   correct: boolean | null;
+  invalid: boolean;
+  invalidReason: string | null;
   kalshiProb: number;
   modelProb: number;
   edge: number;
@@ -54,6 +56,7 @@ export interface FAQ {
 export interface PerformanceStats {
   totalPicks: number;
   resolvedPicks: number;
-  accuracy: number;
+  /** null when nothing scored yet (backend `accuracy_percent` is null). */
+  accuracy: number | null;
   currentStreak: number;
 }

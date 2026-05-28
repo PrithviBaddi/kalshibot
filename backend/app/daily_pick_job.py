@@ -8,6 +8,7 @@ even when KALSHIBOT_USER_AUTH=1, so the job can run without any user’s credent
 from __future__ import annotations
 
 import calendar
+import difflib
 import logging
 import os
 import re
@@ -20,7 +21,7 @@ import httpx
 from app.analysis import build_market_analysis
 from app.daily_pick_claude import enrich_daily_pick_with_claude
 from app.daily_pick_context import build_daily_pick_briefing
-from app.db import _utc_day_string, get_global_daily_pick, upsert_global_daily_pick
+from app.db import daily_pick_wall_clock_day_et, get_global_daily_pick, upsert_global_daily_pick
 from app.scanner import dedupe_markets_by_ticker, summarize_market
 from kalshi.client import KalshiClient
 
@@ -40,6 +41,7 @@ _NARROW_BAND_TITLE_RE = re.compile(r"\bbetween\s+\d+(?:\.\d+)?\s+and\s+\d+(?:\.\
 _NARROW_BAND_TICKER_RE = re.compile(r"H\d{4}")
 _EXCLUDED_PREFIXES = ("KXSP500ADD", "KXSP500REMOVE")
 _FINANCIALS_PRIORITY_PREFIXES = ("KXFED", "KXTERMINALRATE", "KXCOIN", "KXBTC", "KXOIL")
+_TITLE_SIMILARITY_MIN = float(os.getenv("DAILY_PICK_TITLE_SIMILARITY_MIN", "0.60"))
 
 # UTC weekday: Mon=0 … Sun=6. Sun runs a 3-way tournament (highest pool score wins).
 _WEEKDAY_TO_CATEGORY: dict[int, str] = {
@@ -299,9 +301,72 @@ async def _fetch_market(k: KalshiClient, ticker: str) -> dict[str, Any]:
     raise RuntimeError(f"Unexpected Kalshi market shape for {ticker}")
 
 
-async def _evaluate_one_candidate(k: KalshiClient, ticker: str, utc_day: str, pick_category: str = "") -> dict[str, Any]:
-    market = await _fetch_market(k, ticker)
+def _norm_text(s: str) -> str:
+    return " ".join((s or "").strip().lower().split())
+
+
+def _title_similarity(a: str, b: str) -> float:
+    return difflib.SequenceMatcher(a=_norm_text(a), b=_norm_text(b)).ratio()
+
+
+def _market_is_tradeable_now(market: dict[str, Any]) -> bool:
+    status = str(market.get("status") or "").strip().lower()
+    if status and status not in ("active", "open"):
+        return False
+    if market.get("can_close") is True:
+        return False
+    if market.get("closed") is True:
+        return False
+    result = str(market.get("result") or market.get("settlement_status") or "").strip().lower()
+    if result and result not in ("", "unresolved", "open", "active"):
+        return False
+    close = _to_dt(market.get("close_time") or market.get("expiration_time") or market.get("end_date"))
+    if close is not None and close <= datetime.now(timezone.utc):
+        return False
+    return True
+
+
+async def _fetch_and_validate_fresh_candidate(
+    k: KalshiClient,
+    ticker: str,
+    scanner_title: str,
+) -> dict[str, Any] | None:
+    try:
+        market = await _fetch_market(k, ticker)
+    except Exception:
+        logger.warning("Skipping %s: market not found or already closed.", ticker)
+        return None
+    if not _market_is_tradeable_now(market):
+        logger.warning("Skipping %s: market not found or already closed.", ticker)
+        return None
+    fresh_title = str(market.get("title") or "")
+    if scanner_title and fresh_title:
+        sim = _title_similarity(scanner_title, fresh_title)
+        if sim < _TITLE_SIMILARITY_MIN:
+            logger.warning(
+                "Skipping %s: scanner/fresh title mismatch (sim=%.2f scanner=%r fresh=%r)",
+                ticker,
+                sim,
+                scanner_title[:220],
+                fresh_title[:220],
+            )
+            return None
+    return market
+
+
+async def _evaluate_one_candidate(
+    k: KalshiClient,
+    ticker: str,
+    utc_day: str,
+    pick_category: str = "",
+    *,
+    scanner_title: str = "",
+) -> dict[str, Any] | None:
+    market = await _fetch_and_validate_fresh_candidate(k, ticker, scanner_title)
+    if market is None:
+        return None
     analysis = build_market_analysis(market)
+    analysis["title"] = str(market.get("title") or analysis.get("title") or ticker)
     implied = float(analysis.get("implied_yes_probability") or 0.0)
     title = str(analysis.get("title") or "")
 
@@ -353,6 +418,9 @@ async def _evaluate_one_candidate(k: KalshiClient, ticker: str, utc_day: str, pi
     if rec not in ("BUY_YES", "BUY_NO", "PASS"):
         rec = "PASS"
     reasoning = str(analysis.get("reasoning") or analysis.get("rationale") or "").strip()
+    contract_title = str(analysis.get("title") or market.get("title") or ticker).strip()
+    if contract_title:
+        analysis["contract_reference"] = f"{ticker} — {contract_title}"
 
     research_h = analysis.get("claude_research_headlines")
     headlines_out: list[Any] = research_h if isinstance(research_h, list) and research_h else list(
@@ -417,7 +485,7 @@ async def run_daily_pick_generation() -> dict[str, Any]:
       4) relaxed volume
     - Score candidates by scanner quality, run Claude on top 5, choose largest actionable edge.
     """
-    day = _utc_day_string()
+    day = daily_pick_wall_clock_day_et()
     if get_global_daily_pick(day):
         logger.info("run_daily_pick_generation: skip — pick already exists for %s", day)
         return {"ok": True, "skipped": True, "day": day}
@@ -447,28 +515,17 @@ async def run_daily_pick_generation() -> dict[str, Any]:
                 "note": "DAILY_PICK_CATEGORY overrides weekday rotation",
             }
             logger.info("Daily pick using env category=%s (override)", category)
-        elif _MAX_DAYS_TO_RESOLVE <= 14:
+        else:
             base_categories = list(_SUNDAY_CATEGORIES)
             category = "Combined"
             rotation_meta = {
-                "mode": "short_window_all_categories",
+                "mode": "all_categories_daily",
                 "max_days_to_resolve": _MAX_DAYS_TO_RESOLVE,
-                "categories": list(base_categories),
-            }
-            logger.info("Short window mode: scanning all categories simultaneously.")
-        elif wd == 6:
-            category, filtered, spread_relaxed, rotation_meta = await _sunday_select_category_and_pool(k)
-            base_categories = [category]
-        else:
-            category = _WEEKDAY_TO_CATEGORY[wd]
-            base_categories = [category]
-            rotation_meta = {
-                "mode": "weekday_rotation",
                 "utc_weekday": calendar.day_name[wd],
                 "utc_weekday_index": wd,
-                "category": category,
+                "categories": list(base_categories),
             }
-            logger.info("Daily pick weekday rotation: %s → category=%s", calendar.day_name[wd], category)
+            logger.info("Daily pick mode: scanning all categories simultaneously.")
 
         filtered: list[dict[str, Any]] = []
         spread_used = _MAX_SPREAD
@@ -549,10 +606,19 @@ async def run_daily_pick_generation() -> dict[str, Any]:
         eval_results: list[dict[str, Any]] = []
         for row in top:
             ticker = str(row["scan"].get("ticker") or row["market"].get("ticker") or "")
+            scanner_title = str(row["market"].get("title") or "")
             if not ticker:
                 continue
             try:
-                res = await _evaluate_one_candidate(k, ticker, day, category)
+                res = await _evaluate_one_candidate(
+                    k,
+                    ticker,
+                    day,
+                    category,
+                    scanner_title=scanner_title,
+                )
+                if res is None:
+                    continue
                 eval_results.append(res)
             except Exception as e:
                 logger.warning("Daily pick candidate failed ticker=%s err=%s", ticker, e)
@@ -561,6 +627,30 @@ async def run_daily_pick_generation() -> dict[str, Any]:
             raise RuntimeError("Could not evaluate any top candidate with Claude.")
 
         selected = _pick_best_result(eval_results)
+        if str(selected.get("recommended_action") or "PASS").upper() == "PASS":
+            best_by_edge = max(eval_results, key=lambda x: abs(float(x.get("edge") or 0.0)))
+            edge_abs = abs(float(best_by_edge.get("edge") or 0.0))
+            cs_val = int(best_by_edge.get("confidence_score") or 0)
+            if edge_abs >= 0.10 and cs_val >= 50:
+                selected = dict(best_by_edge)
+                selected["recommended_action"] = "BUY_YES" if float(selected.get("edge") or 0.0) >= 0 else "BUY_NO"
+                r0 = str(selected.get("reasoning") or "").strip()
+                if r0:
+                    selected["reasoning"] = (
+                        r0 + " Confidence is moderate; this pick is surfaced due to a meaningful edge."
+                    )[:4000]
+                else:
+                    selected["reasoning"] = (
+                        "Confidence is moderate; this pick is surfaced due to a meaningful edge."
+                    )
+                if isinstance(selected.get("analysis"), dict):
+                    selected["analysis"] = {
+                        **selected["analysis"],
+                        "recommended_action": selected["recommended_action"],
+                        "reasoning": selected["reasoning"],
+                        "rationale": selected["reasoning"],
+                    }
+                selected["selection_reason"] = "moderate_confidence_fallback_edge_priority"
         market = selected["market"]
         analysis = selected["analysis"]
         implied = float(selected["implied"])
@@ -571,6 +661,14 @@ async def run_daily_pick_generation() -> dict[str, Any]:
         raw_claude = selected.get("raw_claude")
         used_claude = bool(selected.get("used_claude"))
         reasoning_text = str(selected.get("reasoning") or "").strip()
+        selected_ticker = str(selected.get("ticker") or market.get("ticker") or "")
+        selected_title = str(analysis.get("title") or market.get("title") or selected_ticker)
+        contract_note = f"Contract analyzed: {selected_ticker} — {selected_title}."
+        if reasoning_text:
+            if selected_ticker and selected_ticker not in reasoning_text:
+                reasoning_text = f"{contract_note} {reasoning_text}".strip()
+        else:
+            reasoning_text = contract_note
 
         lean = "YES" if model_y >= implied else "NO"
         summary = f"{rec_action}: {reasoning_text[:1600]}".strip() if reasoning_text else f"{rec_action}: No rationale returned."

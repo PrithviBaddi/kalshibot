@@ -1,8 +1,42 @@
 'use client';
 
+import { useEffect, useState } from 'react';
 import Link from 'next/link';
+import { fetchLatestPickFromHistory, fetchPerformanceStats } from '@/lib/api';
+import type { DailyPick, PerformanceStats } from '@/lib/types';
 
 export function Hero() {
+  const [stats, setStats] = useState<PerformanceStats>({
+    totalPicks: 0,
+    resolvedPicks: 0,
+    accuracy: null,
+    currentStreak: 0,
+  });
+  const [preview, setPreview] = useState<DailyPick | null>(null);
+
+  useEffect(() => {
+    let active = true;
+    (async () => {
+      try {
+        const [s, p] = await Promise.all([
+          fetchPerformanceStats(),
+          fetchLatestPickFromHistory(),
+        ]);
+        if (!active) return;
+        setStats(s);
+        setPreview(p);
+      } catch {
+        // keep graceful fallback UI values
+      }
+    })();
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  const accuracyLabel = stats.accuracy === null ? '—' : `${stats.accuracy}%`;
+  const updatedLabel = preview?.updatedAt ? preview.updatedAt : 'recently';
+
   return (
     <section className="relative min-h-screen overflow-hidden pt-20">
       {/* Dramatic ambient lighting */}
@@ -83,17 +117,17 @@ export function Hero() {
             {/* Social proof stats */}
             <div className="opacity-0 animate-fade-in-up mt-16 flex items-center gap-12" style={{ animationDelay: '0.5s', animationFillMode: 'forwards' }}>
               <div>
-                <div className="font-mono text-3xl lg:text-4xl text-foreground">68.3%</div>
+                <div className="font-mono text-3xl lg:text-4xl text-foreground">{accuracyLabel}</div>
                 <div className="mt-1 font-mono text-xs uppercase tracking-wider text-muted-foreground">Accuracy</div>
               </div>
               <div className="h-12 w-px bg-border/50" />
               <div>
-                <div className="font-mono text-3xl lg:text-4xl text-foreground">156</div>
+                <div className="font-mono text-3xl lg:text-4xl text-foreground">{stats.totalPicks}</div>
                 <div className="mt-1 font-mono text-xs uppercase tracking-wider text-muted-foreground">Picks Made</div>
               </div>
               <div className="h-12 w-px bg-border/50 hidden sm:block" />
               <div className="hidden sm:block">
-                <div className="font-mono text-3xl lg:text-4xl text-success">+5</div>
+                <div className="font-mono text-3xl lg:text-4xl text-success">{stats.currentStreak}</div>
                 <div className="mt-1 font-mono text-xs uppercase tracking-wider text-muted-foreground">Win Streak</div>
               </div>
             </div>
@@ -117,12 +151,15 @@ export function Hero() {
                     </div>
                     <span className="font-mono text-xs uppercase tracking-wider text-muted-foreground">Live Pick</span>
                   </div>
-                  <span className="font-mono text-xs text-muted-foreground">Updated 12m ago</span>
+                  <span className="font-mono text-xs text-muted-foreground">Updated {updatedLabel}</span>
                 </div>
 
                 {/* Question */}
                 <p className="editorial-heading text-xl lg:text-2xl text-foreground mb-8">
-                  Will Bitcoin exceed $50,000 by end of January?
+                  {preview?.question || 'No recent pick available yet.'}
+                </p>
+                <p className="font-mono text-[11px] text-muted-foreground mb-6">
+                  Contract: {preview?.ticker || 'N/A'}
                 </p>
 
                 {/* Probability comparison */}
@@ -135,11 +172,11 @@ export function Hero() {
                         <circle
                           cx="50" cy="50" r="42" fill="none" strokeWidth="6" strokeLinecap="round"
                           className="stroke-muted-foreground/60 transition-all duration-1000"
-                          style={{ strokeDasharray: 264, strokeDashoffset: 264 - (42 / 100) * 264 }}
+                          style={{ strokeDasharray: 264, strokeDashoffset: 264 - ((preview?.kalshiProb || 0) / 100) * 264 }}
                         />
                       </svg>
                       <div className="absolute inset-0 flex flex-col items-center justify-center">
-                        <span className="font-mono text-xl lg:text-2xl font-medium text-muted-foreground">42</span>
+                        <span className="font-mono text-xl lg:text-2xl font-medium text-muted-foreground">{preview?.kalshiProb ?? 0}</span>
                         <span className="font-mono text-[10px] text-muted-foreground/60">%</span>
                       </div>
                     </div>
@@ -149,9 +186,9 @@ export function Hero() {
                   {/* Recommendation badge */}
                   <div className="flex flex-col items-center gap-2">
                     <div className="rounded-lg bg-success px-4 py-2 glow-success">
-                      <span className="font-mono text-sm font-bold uppercase tracking-wider text-success-foreground">BUY YES</span>
+                      <span className="font-mono text-sm font-bold uppercase tracking-wider text-success-foreground">{preview?.recommendation?.replace('_', ' ') || 'PASS'}</span>
                     </div>
-                    <span className="font-mono text-xs text-success">+25% edge</span>
+                    <span className="font-mono text-xs text-success">+{preview?.edge ?? 0}% edge</span>
                   </div>
 
                   {/* Our Model */}
@@ -162,11 +199,11 @@ export function Hero() {
                         <circle
                           cx="50" cy="50" r="42" fill="none" strokeWidth="6" strokeLinecap="round"
                           className="stroke-primary transition-all duration-1000"
-                          style={{ strokeDasharray: 264, strokeDashoffset: 264 - (67 / 100) * 264 }}
+                          style={{ strokeDasharray: 264, strokeDashoffset: 264 - ((preview?.modelProb || 0) / 100) * 264 }}
                         />
                       </svg>
                       <div className="absolute inset-0 flex flex-col items-center justify-center">
-                        <span className="font-mono text-xl lg:text-2xl font-medium text-primary">67</span>
+                        <span className="font-mono text-xl lg:text-2xl font-medium text-primary">{preview?.modelProb ?? 0}</span>
                         <span className="font-mono text-[10px] text-primary/60">%</span>
                       </div>
                     </div>
@@ -178,19 +215,19 @@ export function Hero() {
                 <div className="mb-6">
                   <div className="flex items-center justify-between mb-2">
                     <span className="font-mono text-xs text-muted-foreground">Confidence</span>
-                    <span className="font-mono text-xs font-medium text-success">72/100</span>
+                    <span className="font-mono text-xs font-medium text-success">{preview?.confidence ?? 0}/100</span>
                   </div>
                   <div className="h-1.5 rounded-full bg-muted/50 overflow-hidden">
                     <div 
                       className="h-full rounded-full bg-gradient-to-r from-primary via-success to-success transition-all duration-1000"
-                      style={{ width: '72%' }}
+                      style={{ width: `${preview?.confidence ?? 0}%` }}
                     />
                   </div>
                 </div>
 
                 {/* Sources */}
                 <div className="flex flex-wrap gap-2">
-                  {['Web Search', 'Market Data', 'Price History', 'Macro'].map((source) => (
+                  {(preview?.sourcesUsed || []).map((source) => (
                     <span key={source} className="rounded-full border border-border/50 bg-secondary/50 px-3 py-1 font-mono text-[10px] text-muted-foreground">
                       {source}
                     </span>

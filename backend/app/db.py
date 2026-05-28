@@ -203,6 +203,8 @@ def _saas_extras_migrate(con: sqlite3.Connection) -> None:
         ("resolved_at", "INTEGER"),
         ("context_sources_used", "TEXT"),
         ("resolution_result", "TEXT"),
+        ("invalid", "INTEGER"),
+        ("invalid_reason", "TEXT"),
     ):
         if gcols and col not in gcols:
             con.execute(f"ALTER TABLE global_daily_picks ADD COLUMN {col} {typ}")
@@ -961,6 +963,34 @@ def _utc_day_string() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
+def daily_pick_wall_clock_day_et() -> str:
+    """ET calendar date (YYYY-MM-DD) by America/New_York wall clock (no 9 AM shift)."""
+
+    from datetime import datetime, timezone
+    from zoneinfo import ZoneInfo
+
+    now_et = datetime.now(timezone.utc).astimezone(ZoneInfo("America/New_York"))
+    return now_et.strftime("%Y-%m-%d")
+
+
+def daily_pick_effective_day_et() -> str:
+    """
+    ET date for resolving GET /today: which stored row counts as \"the latest pick\".
+
+    Before DAILY_PICK_RUN_HOUR_ET (default 9) locally, stays on yesterday's ET date
+    so overnight users keep seeing yesterday morning's pick until today's run hour.
+    """
+    from datetime import datetime, timedelta, timezone
+    from zoneinfo import ZoneInfo
+
+    run_hour = max(0, min(23, int(os.getenv("DAILY_PICK_RUN_HOUR_ET", "9"))))
+    now_et = datetime.now(timezone.utc).astimezone(ZoneInfo("America/New_York"))
+    anchor = (
+        now_et.date() - timedelta(days=1) if now_et.hour < run_hour else now_et.date()
+    )
+    return anchor.strftime("%Y-%m-%d")
+
+
 def save_password_reset_token(*, user_id: int, token_hash: str, expires_at: int) -> None:
     with connect() as con:
         con.execute("DELETE FROM password_reset_tokens WHERE user_id = ?", (user_id,))
@@ -1022,7 +1052,8 @@ def get_global_daily_pick(day: str) -> dict[str, Any] | None:
             SELECT day, ticker, title, summary, confidence, pick_json, created_at,
                    market_implied_yes, model_yes_probability, confidence_score,
                    edge, recommended_action, reasoning,
-                   resolved, resolution_correct, resolved_at, context_sources_used, resolution_result
+                   resolved, resolution_correct, resolved_at, context_sources_used, resolution_result,
+                   invalid, invalid_reason
             FROM global_daily_picks WHERE day = ?
             """,
             (day,),
@@ -1063,6 +1094,8 @@ def get_global_daily_pick(day: str) -> dict[str, Any] | None:
             "resolved_at": _i("resolved_at"),
             "context_sources_used": _row_json_list(row["context_sources_used"]),
             "resolution_result": _s("resolution_result"),
+            "invalid": bool(int(row["invalid"] or 0)),
+            "invalid_reason": _s("invalid_reason"),
         }
 
 
@@ -1138,7 +1171,8 @@ def list_global_daily_pick_history(*, limit: int = 30) -> list[dict[str, Any]]:
             SELECT day, ticker, title, summary, confidence, pick_json, created_at,
                    market_implied_yes, model_yes_probability, confidence_score,
                    edge, recommended_action, reasoning,
-                   resolved, resolution_correct, resolved_at, context_sources_used, resolution_result
+                   resolved, resolution_correct, resolved_at, context_sources_used, resolution_result,
+                   invalid, invalid_reason
             FROM global_daily_picks
             ORDER BY day DESC
             LIMIT ?
@@ -1169,6 +1203,8 @@ def list_global_daily_pick_history(*, limit: int = 30) -> list[dict[str, Any]]:
                 "resolved_at": int(row["resolved_at"]) if row["resolved_at"] is not None else None,
                 "context_sources_used": _row_json_list(row["context_sources_used"]),
                 "resolution_result": row["resolution_result"] if row["resolution_result"] is not None else None,
+                "invalid": bool(int(row["invalid"] or 0)),
+                "invalid_reason": row["invalid_reason"] if row["invalid_reason"] is not None else None,
             }
         )
     return out
@@ -1228,26 +1264,30 @@ def apply_automatic_daily_pick_resolution(
 
 
 def get_daily_pick_accuracy_stats() -> dict[str, Any]:
-    """Aggregate calibration stats (PASS resolved counts toward total_resolved, not accuracy)."""
+    """Aggregate calibration stats excluding invalid rows and non-directional actions."""
     with connect() as con:
         rows = con.execute(
             """
-            SELECT recommended_action, resolved, resolution_correct
+            SELECT recommended_action, resolved, resolution_correct, invalid
             FROM global_daily_picks
             """
         ).fetchall()
 
     def norm_action(a: Any) -> str:
         s = str(a or "PASS").upper().strip().replace(" ", "_").replace("-", "_")
-        if s in ("BUY_YES", "BUY_NO", "PASS"):
+        if s in ("BUY_YES", "BUY_NO", "PASS", "NO_SIGNAL"):
             return s
         return "PASS"
 
-    total_picks = len(rows)
-    resolved_rows = [r for r in rows if r["resolved"] is not None and int(r["resolved"]) == 1]
+    valid_rows = [r for r in rows if int(r["invalid"] or 0) == 0]
+    directional_rows = [
+        r for r in valid_rows if norm_action(r["recommended_action"]) in ("BUY_YES", "BUY_NO")
+    ]
+    total_picks = len(directional_rows)
+    resolved_rows = [r for r in valid_rows if r["resolved"] is not None and int(r["resolved"]) == 1]
     total_resolved = len(resolved_rows)
 
-    pass_resolved = [r for r in resolved_rows if norm_action(r["recommended_action"]) == "PASS"]
+    pass_resolved = [r for r in resolved_rows if norm_action(r["recommended_action"]) in ("PASS", "NO_SIGNAL")]
     pass_excluded = len(pass_resolved)
 
     scored = [
@@ -1275,11 +1315,27 @@ def get_daily_pick_accuracy_stats() -> dict[str, Any]:
         "correct": correct,
         "incorrect": incorrect,
         "accuracy_percent": accuracy_percent,
+        "invalid_excluded": len(rows) - len(valid_rows),
         "by_recommended_action": {
             "BUY_YES": breakdown_for("BUY_YES"),
             "BUY_NO": breakdown_for("BUY_NO"),
         },
     }
+
+
+def invalidate_global_daily_pick(*, day: str, reason: str) -> bool:
+    with connect() as con:
+        cur = con.execute(
+            """
+            UPDATE global_daily_picks
+            SET invalid = 1,
+                invalid_reason = ?
+            WHERE day = ?
+            """,
+            (reason[:500], day),
+        )
+        con.commit()
+        return cur.rowcount > 0
 
 
 def resolve_global_daily_pick(

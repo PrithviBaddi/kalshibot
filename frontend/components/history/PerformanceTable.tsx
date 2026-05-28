@@ -10,6 +10,19 @@ interface PerformanceTableProps {
 
 export function PerformanceTable({ data }: PerformanceTableProps) {
   const getResultIndicator = (row: HistoryRow) => {
+    if (row.invalid) {
+      return (
+        <span
+          className="font-mono text-xs text-muted-foreground"
+          title={row.invalidReason || 'Invalid market reference'}
+        >
+          Invalid — bad ticker
+        </span>
+      );
+    }
+    if (row.recommendation === 'PASS' || row.recommendation === 'NO_SIGNAL') {
+      return <span className="font-mono text-xs text-muted-foreground">N/A</span>;
+    }
     if (!row.resolved) {
       return (
         <div className="flex items-center justify-center gap-2">
@@ -92,7 +105,7 @@ export function PerformanceTable({ data }: PerformanceTableProps) {
                       {row.question}
                     </span>
                     <span className="mt-1 font-mono text-xs text-primary/70">
-                      {row.ticker}
+                      Contract: {row.ticker}
                     </span>
                   </div>
                 </td>
@@ -128,7 +141,7 @@ export function PerformanceTable({ data }: PerformanceTableProps) {
                   {row.question}
                 </p>
                 <div className="flex items-center gap-3">
-                  <span className="font-mono text-xs text-primary/70">{row.ticker}</span>
+                  <span className="font-mono text-xs text-primary/70">Contract: {row.ticker}</span>
                   <span className="font-mono text-xs text-muted-foreground">
                     {new Date(row.date).toLocaleDateString('en-US', {
                       month: 'short',

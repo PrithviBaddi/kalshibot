@@ -5,11 +5,12 @@ import Link from 'next/link';
 import { DailyPickCard } from '@/components/daily-pick/DailyPickCard';
 import { EmptyState } from '@/components/shared/EmptyState';
 import { DailyPickSkeleton } from '@/components/shared/LoadingSkeleton';
-import { fetchTodayPick } from '@/lib/api';
+import { fetchLatestPickFromHistory, fetchTodayPick } from '@/lib/api';
 import type { DailyPick } from '@/lib/types';
 
 export function DailyPickClient() {
   const [pick, setPick] = useState<DailyPick | null>(null);
+  const [latestLabel, setLatestLabel] = useState<string>('');
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
 
@@ -20,7 +21,26 @@ export function DailyPickClient() {
         setLoading(true);
         setError('');
         const p = await fetchTodayPick();
-        if (active) setPick(p);
+        if (p) {
+          if (active) {
+            setPick(p);
+            setLatestLabel('');
+          }
+        } else {
+          const fallback = await fetchLatestPickFromHistory();
+          if (active) {
+            setPick(fallback);
+            if (fallback?.date) {
+              const dt = new Date(fallback.date);
+              const label = Number.isNaN(dt.getTime())
+                ? fallback.date
+                : dt.toLocaleDateString('en-US', { month: 'long', day: 'numeric' });
+              setLatestLabel(`Latest pick — ${label}`);
+            } else {
+              setLatestLabel('');
+            }
+          }
+        }
       } catch (e) {
         if (active) setError(e instanceof Error ? e.message : 'Failed to load daily pick.');
       } finally {
@@ -79,7 +99,14 @@ export function DailyPickClient() {
         ) : error ? (
           <EmptyState title="Could not load daily pick" description={error} action={{ label: 'Retry', onClick: () => location.reload() }} />
         ) : pick ? (
-          <DailyPickCard pick={pick} />
+          <div>
+            {latestLabel ? (
+              <div className="mb-4 inline-flex items-center rounded-full border border-warning/30 bg-warning/10 px-4 py-2 font-mono text-xs text-warning">
+                {latestLabel}
+              </div>
+            ) : null}
+            <DailyPickCard pick={pick} />
+          </div>
         ) : (
           <EmptyState
             title="No daily pick available"

@@ -15,7 +15,7 @@ export function HistoryClient() {
   const [stats, setStats] = useState<PerformanceStats>({
     totalPicks: 0,
     resolvedPicks: 0,
-    accuracy: 0,
+    accuracy: null,
     currentStreak: 0,
   });
   const [loading, setLoading] = useState(true);
@@ -23,6 +23,7 @@ export function HistoryClient() {
   const [dateRange, setDateRange] = useState('all');
   const [recType, setRecType] = useState('all');
   const [resolvedFilter, setResolvedFilter] = useState('all');
+  const [showInconclusive, setShowInconclusive] = useState(false);
 
   useEffect(() => {
     let active = true;
@@ -58,6 +59,10 @@ export function HistoryClient() {
     }
     return out;
   }, [rows, dateRange, recType, resolvedFilter]);
+  const isInconclusive = (row: HistoryRow) =>
+    row.recommendation === 'PASS' || row.recommendation === 'NO_SIGNAL';
+  const directionalRows = filtered.filter((r) => !isInconclusive(r));
+  const inconclusiveRows = filtered.filter(isInconclusive);
 
   return (
     <div className="relative min-h-screen pt-28 pb-20">
@@ -128,10 +133,36 @@ export function HistoryClient() {
               <HistoryFilters onDateRangeChange={setDateRange} onTypeChange={setRecType} onResolvedChange={setResolvedFilter} />
             </div>
 
-            {filtered.length === 0 ? (
+            {directionalRows.length === 0 ? (
               <EmptyState title="No rows matched your filters" description="Try adjusting period, type, or status filters." />
             ) : (
-              <PerformanceTable data={filtered} />
+              <PerformanceTable data={directionalRows} />
+            )}
+            {inconclusiveRows.length > 0 && (
+              <div className="mt-6 glass-card rounded-2xl p-4">
+                <button
+                  type="button"
+                  onClick={() => setShowInconclusive((v) => !v)}
+                  className="w-full flex items-center justify-between gap-4 text-left"
+                >
+                  <div>
+                    <h3 className="font-mono text-sm text-foreground uppercase tracking-[0.12em]">
+                      Inconclusive — no strong signal
+                    </h3>
+                    <p className="mt-1 text-xs text-muted-foreground">
+                      PASS and NO_SIGNAL picks are tracked here and excluded from main accuracy display.
+                    </p>
+                  </div>
+                  <span className="font-mono text-xs text-muted-foreground">
+                    {showInconclusive ? 'Hide' : 'Show'} ({inconclusiveRows.length})
+                  </span>
+                </button>
+                {showInconclusive && (
+                  <div className="mt-4">
+                    <PerformanceTable data={inconclusiveRows} />
+                  </div>
+                )}
+              </div>
             )}
           </>
         )}

@@ -12,10 +12,12 @@ from app.api_auth import get_api_token
 from app.daily_pick_job import run_daily_pick_generation
 from app.daily_pick_resolution import run_daily_pick_resolution_check
 from app.db import (
-    _utc_day_string,
+    daily_pick_effective_day_et,
+    daily_pick_wall_clock_day_et,
     delete_global_daily_pick,
     get_daily_pick_accuracy_stats,
     get_global_daily_pick,
+    invalidate_global_daily_pick,
     list_global_daily_pick_history,
     resolve_global_daily_pick,
 )
@@ -40,6 +42,17 @@ class ResolveDailyPickBody(BaseModel):
                 raise ValueError("resolution_correct is required when resolved is true")
         elif self.resolution_correct is not None:
             raise ValueError("resolution_correct must be omitted when resolved is false")
+        return self
+
+
+class InvalidateDailyPickBody(BaseModel):
+    date: str = Field(..., min_length=10, max_length=10, description='Calendar day "YYYY-MM-DD"')
+    reason: str = Field(..., min_length=5, max_length=500)
+
+    @model_validator(mode="after")
+    def _validate(self):
+        if not re.match(r"^\d{4}-\d{2}-\d{2}$", self.date.strip()):
+            raise ValueError('date must be a day string like "2026-05-13"')
         return self
 
 
@@ -86,10 +99,14 @@ def _require_user_jwt_not_api_token(request: Request) -> None:
 
 @router.get("/today")
 async def get_today_pick() -> dict[str, Any]:
-    """Any logged-in user (Free or Pro). No Kalshi credentials required."""
+    """Any logged-in user (Free or Pro). No Kalshi credentials required.
+
+    The effective date rolls at DAILY_PICK_RUN_HOUR_ET America/New_York (default 9 AM),
+    not UTC midnight, so overnight users still see the prior morning pick until then.
+    """
     if not user_auth_enabled():
         raise HTTPException(status_code=503, detail="Daily picks are defined for multi-user mode (KALSHIBOT_USER_AUTH=1).")
-    day = _utc_day_string()
+    day = daily_pick_effective_day_et()
     row = get_global_daily_pick(day)
     if not row:
         return {
@@ -113,6 +130,8 @@ async def get_today_pick() -> dict[str, Any]:
             "resolved_at": None,
             "context_sources_used": None,
             "resolution_result": None,
+            "invalid": False,
+            "invalid_reason": None,
         }
     return {
         "ok": True,
@@ -134,6 +153,8 @@ async def get_today_pick() -> dict[str, Any]:
         "resolved_at": row.get("resolved_at"),
         "context_sources_used": row.get("context_sources_used"),
         "resolution_result": row.get("resolution_result"),
+        "invalid": row.get("invalid"),
+        "invalid_reason": row.get("invalid_reason"),
     }
 
 
@@ -152,10 +173,13 @@ async def generate_daily_pick(request: Request) -> dict[str, Any]:
 async def delete_today_pick(request: Request) -> dict[str, Any]:
     """Operator/admin: delete today's stored pick so generation can be rerun."""
     _require_admin_bearer(request)
-    day = _utc_day_string()
+    day = daily_pick_wall_clock_day_et()
     deleted = delete_global_daily_pick(day)
     if not deleted:
-        raise HTTPException(status_code=404, detail=f"No daily pick stored for UTC day {day}.")
+        raise HTTPException(
+            status_code=404,
+            detail=f"No daily pick stored for ET calendar day {day} (wall clock).",
+        )
     return {"ok": True, "deleted": True, "day": day}
 
 
@@ -175,6 +199,17 @@ async def resolve_daily_pick(request: Request, body: ResolveDailyPickBody) -> di
     if not updated:
         raise HTTPException(status_code=404, detail=f"No daily pick stored for day {day}.")
     return {"ok": True, "day": day, "resolved": body.resolved, "resolution_correct": body.resolution_correct}
+
+
+@router.post("/invalidate")
+async def invalidate_daily_pick(request: Request, body: InvalidateDailyPickBody) -> dict[str, Any]:
+    """Operator/admin: mark a stored pick row as invalid and exclude from accuracy."""
+    _require_admin_bearer(request)
+    day = body.date.strip()
+    updated = invalidate_global_daily_pick(day=day, reason=body.reason.strip())
+    if not updated:
+        raise HTTPException(status_code=404, detail=f"No daily pick stored for day {day}.")
+    return {"ok": True, "day": day, "invalid": True, "reason": body.reason.strip()}
 
 
 @router.post("/check-resolutions")
