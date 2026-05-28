@@ -1,4 +1,5 @@
 import type { DailyPick, HistoryRow, PerformanceStats, RecommendationType } from './types';
+import { getAccessToken } from './auth';
 
 function normalizeApiBase(raw?: string): string {
   const v = (raw || '').trim();
@@ -10,19 +11,29 @@ function normalizeApiBase(raw?: string): string {
 const API_BASE = normalizeApiBase(process.env.NEXT_PUBLIC_API_BASE);
 const ADMIN_TOKEN = (process.env.NEXT_PUBLIC_API_TOKEN || '').trim();
 
-function getAccessToken(): string {
-  if (typeof window === 'undefined') return '';
-  try {
-    return (localStorage.getItem('kalshibot_access_token') || '').trim();
-  } catch {
-    return '';
-  }
-}
-
 function authHeaders(): Record<string, string> {
   const user = getAccessToken();
   const token = user || ADMIN_TOKEN;
   return token ? { Authorization: `Bearer ${token}` } : {};
+}
+
+async function apiPost<T>(path: string, body: unknown): Promise<T> {
+  let r: Response;
+  try {
+    r = await fetch(`${API_BASE}${path}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', ...authHeaders() },
+      body: JSON.stringify(body),
+      cache: 'no-store',
+    });
+  } catch (e) {
+    throw new Error(e instanceof Error ? e.message : 'Failed to fetch');
+  }
+  if (!r.ok) {
+    const text = await r.text().catch(() => '');
+    throw new Error(`${r.status}: ${text || r.statusText}`);
+  }
+  return (await r.json()) as T;
 }
 
 async function apiGet<T>(path: string): Promise<T> {
@@ -174,6 +185,110 @@ export async function fetchLatestPickFromHistory(): Promise<DailyPick | null> {
     sourcesUsed: Array.isArray(first.context_sources_used) ? first.context_sources_used : [],
     updatedAt: relTimeFromUnix(first.created_at || null),
   };
+}
+
+export function analysisToDailyPick(
+  analysis: Record<string, unknown>,
+  category = 'Analysis',
+): DailyPick {
+  const kalshiProb = Math.round((Number(analysis.market_implied_yes || 0) || 0) * 100);
+  const modelProb = Math.round((Number(analysis.model_yes_probability || 0) || 0) * 100);
+  return {
+    id: String(analysis.ticker || 'ondemand'),
+    date: new Date().toISOString().slice(0, 10),
+    question: String(analysis.title || analysis.ticker || ''),
+    ticker: String(analysis.ticker || ''),
+    category: String(analysis.category || category),
+    kalshiProb,
+    modelProb,
+    recommendation: toRec(analysis.recommended_action),
+    confidence: Math.max(1, Math.min(100, Number(analysis.confidence_score || 50))),
+    reasoning: String(analysis.reasoning || ''),
+    edge: Math.round(Math.abs(Number(analysis.edge || 0)) * 100),
+    source: 'KalshiBot AI',
+    sourcesUsed: Array.isArray(analysis.context_sources_used)
+      ? (analysis.context_sources_used as string[])
+      : [],
+    updatedAt: 'just now',
+  };
+}
+
+export async function runOnDemandAnalysis(ticker: string): Promise<DailyPick> {
+  const d = await apiPost<{ ok: boolean; analysis: Record<string, unknown> }>(
+    '/api/v1/analysis/on-demand',
+    { ticker },
+  );
+  return analysisToDailyPick(d.analysis);
+}
+
+export type BatchRun = {
+  run_id: string;
+  timestamp: number;
+  total_picks: number;
+  resolved_count: number;
+  accuracy_percent: number | null;
+};
+
+export type BatchAccuracy = {
+  overall: { total: number; resolved: number; actionable_resolved: number; correct: number; accuracy_percent: number | null };
+  by_category: Record<string, { total: number; resolved: number; actionable_resolved: number; correct: number; accuracy_percent: number | null }>;
+  by_recommended_action: Record<string, { total: number; resolved: number; actionable_resolved: number; correct: number; accuracy_percent: number | null }>;
+  by_confidence_band: Record<string, { total: number; resolved: number; actionable_resolved: number; correct: number; accuracy_percent: number | null }>;
+};
+
+export async function startBatchAnalyze(categories: string[], topN: number): Promise<string> {
+  const d = await apiPost<{ ok: boolean; run_id: string }>('/api/v1/testing/batch-analyze', {
+    categories,
+    top_n: topN,
+  });
+  return d.run_id;
+}
+
+export async function fetchBatchRuns(): Promise<BatchRun[]> {
+  const d = await apiGet<{ ok: boolean; runs: BatchRun[] }>('/api/v1/testing/batch-runs');
+  return d.runs || [];
+}
+
+export async function fetchBatchAccuracy(): Promise<BatchAccuracy> {
+  const d = await apiGet<BatchAccuracy & { ok: boolean }>('/api/v1/testing/accuracy');
+  return {
+    overall: d.overall,
+    by_category: d.by_category || {},
+    by_recommended_action: d.by_recommended_action || {},
+    by_confidence_band: d.by_confidence_band || {},
+  };
+}
+
+export type MarketRow = {
+  ticker: string;
+  title: string;
+  category: string;
+  volume: number;
+  midProb: number;
+};
+
+export async function fetchMarketsBrowse(limit = 40): Promise<MarketRow[]> {
+  const d = await apiGet<{ markets?: Array<Record<string, unknown>> }>(
+    `/api/v1/markets?limit=${limit}&mve_filter=exclude`,
+  );
+  const markets = Array.isArray(d.markets) ? d.markets : [];
+  return markets
+    .map((m) => {
+      const yesBid = Number(m.yes_bid_dollars ?? m.yes_bid ?? 0);
+      const yesAsk = Number(m.yes_ask_dollars ?? m.yes_ask ?? 0);
+      const mid =
+        yesBid > 0 && yesAsk > 0
+          ? (yesBid + yesAsk) / 2
+          : Number(m.last_price_dollars ?? m.last_price ?? 0.5);
+      return {
+        ticker: String(m.ticker || ''),
+        title: String(m.title || m.subtitle || m.ticker || ''),
+        category: String(m.category || 'Market'),
+        volume: Number(m.volume ?? m.volume_24h ?? 0),
+        midProb: Math.round(mid * 100),
+      };
+    })
+    .filter((m) => m.ticker);
 }
 
 export async function fetchPerformanceStats(): Promise<PerformanceStats> {

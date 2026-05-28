@@ -1,6 +1,7 @@
 import type { Metadata, Viewport } from 'next';
 import { Instrument_Serif, Geist_Mono } from 'next/font/google';
 import { Analytics } from '@vercel/analytics/next';
+import { AuthProvider } from '@/components/shared/AuthProvider';
 import { Navbar } from '@/components/shared/Navbar';
 import { Footer } from '@/components/shared/Footer';
 import './globals.css';
@@ -58,9 +59,11 @@ export default function RootLayout({
         {/* Grain overlay for texture */}
         <div className="grain-overlay" aria-hidden="true" />
         
-        <Navbar />
-        <main className="relative">{children}</main>
-        <Footer />
+        <AuthProvider>
+          <Navbar />
+          <main className="relative">{children}</main>
+          <Footer />
+        </AuthProvider>
         {process.env.NODE_ENV === 'production' && <Analytics />}
       </body>
     </html>

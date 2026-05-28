@@ -72,7 +72,7 @@ from app.feature_flags import jwt_secret, user_auth_enabled
 from app.free_tier_guard import FreeTierApiGuardMiddleware
 from app.jwt_tokens import decode_access_token
 from app.plan_access import is_pro_subscriber
-from app.routers import auth_api, billing_api, daily_pick_api
+from app.routers import auth_api, billing_api, daily_pick_api, on_demand_api, testing_api
 
 load_dotenv()
 
@@ -355,6 +355,8 @@ app.add_middleware(
 app.include_router(auth_api.router)
 app.include_router(billing_api.router)
 app.include_router(daily_pick_api.router)
+app.include_router(testing_api.router)
+app.include_router(on_demand_api.router)
 
 
 @app.get("/health")

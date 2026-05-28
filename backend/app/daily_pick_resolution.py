@@ -10,7 +10,12 @@ from typing import Any
 
 import httpx
 
-from app.db import apply_automatic_daily_pick_resolution, list_unresolved_daily_picks
+from app.db import (
+    apply_automatic_batch_test_resolution,
+    apply_automatic_daily_pick_resolution,
+    list_unresolved_batch_test_picks,
+    list_unresolved_daily_picks,
+)
 from kalshi.client import KalshiClient
 
 logger = logging.getLogger(__name__)
@@ -135,9 +140,64 @@ async def run_daily_pick_resolution_check(k: KalshiClient) -> dict[str, Any]:
         else:
             skipped.append(day)
 
+    batch_rows = list_unresolved_batch_test_picks()
+    batch_updated: list[int] = []
+    batch_skipped = 0
+
+    for row in batch_rows:
+        pick_id = int(row["id"])
+        ticker = str(row["ticker"] or "").strip()
+        action = row.get("recommended_action")
+        if not ticker:
+            batch_skipped += 1
+            continue
+        try:
+            data = await k.get_market(ticker)
+        except httpx.HTTPStatusError as e:
+            errors.append({"batch_pick_id": pick_id, "ticker": ticker, "error": f"http_{e.response.status_code}"})
+            continue
+        except httpx.HTTPError as e:
+            errors.append({"batch_pick_id": pick_id, "ticker": ticker, "error": str(e)})
+            continue
+
+        m = _coerce_market(data if isinstance(data, dict) else {})
+        if not m or not _market_settled_for_autoresolve(m):
+            batch_skipped += 1
+            continue
+
+        outcome = _binary_settlement_outcome(m)
+        if not outcome:
+            batch_skipped += 1
+            continue
+
+        rc = _resolution_correct_for_pick(
+            str(action) if action is not None else None,
+            outcome,
+        )
+        now = int(time.time())
+        if apply_automatic_batch_test_resolution(
+            pick_id=pick_id,
+            resolution_result=outcome,
+            resolution_correct=rc,
+            resolved_at=now,
+        ):
+            batch_updated.append(pick_id)
+            logger.info(
+                "batch_test_resolution: pick_id=%s ticker=%s outcome=%s correct=%s",
+                pick_id,
+                ticker,
+                outcome,
+                rc,
+            )
+        else:
+            batch_skipped += 1
+
     return {
         "checked": len(rows),
         "updated": updated,
         "skipped": len(skipped),
+        "batch_checked": len(batch_rows),
+        "batch_updated": batch_updated,
+        "batch_skipped": batch_skipped,
         "errors": errors,
     }

@@ -98,6 +98,8 @@ def _public_user(row: dict[str, Any], *, kalshi_configured: bool | None = None) 
         "email": row["email"],
         "plan": row.get("plan") or "free",
         "subscription_status": row.get("subscription_status") or "none",
+        "is_admin": bool(int(row.get("is_admin") or 0)),
+        "is_pro": is_pro_subscriber(row),
     }
     if kalshi_configured is not None:
         out["kalshi_configured"] = kalshi_configured

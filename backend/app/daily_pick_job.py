@@ -749,3 +749,88 @@ async def run_daily_pick_generation() -> dict[str, Any]:
     finally:
         if k is not None:
             await k.aclose()
+
+
+async def gather_top_scored_candidates(
+    k: KalshiClient,
+    categories: list[str],
+    *,
+    top_n: int = 30,
+) -> list[dict[str, Any]]:
+    """Scan categories, merge filtered pools, return top N by scanner score (deduped by ticker)."""
+    merged: list[dict[str, Any]] = []
+    for cat in categories:
+        filtered, _raw = await _gather_filtered_for_categories(
+            k,
+            [cat],
+            max_spread=_MAX_SPREAD,
+            min_volume=_MIN_VOLUME,
+        )
+        if not filtered:
+            filtered, _raw = await _gather_filtered_for_categories(
+                k,
+                [cat],
+                max_spread=_MAX_SPREAD_RELAXED,
+                min_volume=_MIN_VOLUME_RELAXED,
+            )
+        for row in filtered:
+            row = dict(row)
+            row["source_category"] = cat
+            merged.append(row)
+
+    best_by_ticker: dict[str, dict[str, Any]] = {}
+    for row in merged:
+        ticker = str(row["scan"].get("ticker") or row["market"].get("ticker") or "").strip()
+        if not ticker:
+            continue
+        prev = best_by_ticker.get(ticker)
+        if prev is None or float(row["scan"].get("score") or 0) > float(prev["scan"].get("score") or 0):
+            best_by_ticker[ticker] = row
+
+    ranked = sorted(
+        best_by_ticker.values(),
+        key=lambda x: (float(x["scan"].get("score") or 0), float(x["scan"].get("volume") or 0)),
+        reverse=True,
+    )
+    return ranked[: max(1, int(top_n))]
+
+
+async def evaluate_market_for_pick(
+    k: KalshiClient,
+    ticker: str,
+    *,
+    pick_category: str = "",
+    utc_day: str | None = None,
+    scanner_title: str = "",
+) -> dict[str, Any] | None:
+    """Full agentic Claude pipeline for one market (shared by batch test and on-demand)."""
+    day = utc_day or daily_pick_wall_clock_day_et()
+    return await _evaluate_one_candidate(
+        k,
+        ticker.strip().upper(),
+        day,
+        pick_category,
+        scanner_title=scanner_title,
+    )
+
+
+def evaluation_result_to_api_dict(result: dict[str, Any]) -> dict[str, Any]:
+    """Normalize `_evaluate_one_candidate` output for REST responses."""
+    market = result.get("market") or {}
+    return {
+        "ticker": str(result.get("ticker") or market.get("ticker") or ""),
+        "title": str(
+            market.get("title")
+            or (result.get("analysis") or {}).get("title")
+            or result.get("ticker")
+            or ""
+        ),
+        "market_implied_yes": float(result.get("implied") or 0.0),
+        "model_yes_probability": float(result.get("model_yes") or 0.0),
+        "confidence_score": result.get("confidence_score"),
+        "edge": float(result.get("edge") or 0.0),
+        "recommended_action": str(result.get("recommended_action") or "PASS"),
+        "reasoning": str(result.get("reasoning") or ""),
+        "context_sources_used": list(result.get("context_sources_used") or []),
+        "used_claude": bool(result.get("used_claude")),
+    }

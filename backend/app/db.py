@@ -159,6 +159,42 @@ def _saas_extras_migrate(con: sqlite3.Connection) -> None:
     )
     con.execute(
         """
+        CREATE TABLE IF NOT EXISTS daily_usage (
+          user_id INTEGER NOT NULL,
+          day TEXT NOT NULL,
+          on_demand_count INTEGER NOT NULL DEFAULT 0,
+          PRIMARY KEY (user_id, day)
+        )
+        """
+    )
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS batch_test_picks (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          run_id TEXT NOT NULL,
+          ticker TEXT NOT NULL,
+          title TEXT NOT NULL,
+          category TEXT,
+          market_implied_yes REAL,
+          model_yes_probability REAL,
+          confidence_score INTEGER,
+          edge REAL,
+          recommended_action TEXT,
+          reasoning TEXT,
+          context_sources_used TEXT,
+          created_at INTEGER NOT NULL,
+          resolved INTEGER,
+          resolution_correct INTEGER,
+          resolved_at INTEGER,
+          resolution_result TEXT
+        )
+        """
+    )
+    con.execute(
+        "CREATE INDEX IF NOT EXISTS idx_batch_test_picks_run ON batch_test_picks(run_id)"
+    )
+    con.execute(
+        """
         CREATE TABLE IF NOT EXISTS password_reset_tokens (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           user_id INTEGER NOT NULL,
@@ -232,6 +268,15 @@ def _stage12_schema_migrate(con: sqlite3.Connection) -> None:
         )
         """
     )
+    ucols = _table_columns(con, "users")
+    if ucols and "is_admin" not in ucols:
+        con.execute("ALTER TABLE users ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0")
+    admin_email = os.getenv("KALSHIBOT_ADMIN_EMAIL", "").strip().lower()
+    if admin_email:
+        con.execute(
+            "UPDATE users SET is_admin = 1 WHERE email = ? COLLATE NOCASE",
+            (admin_email,),
+        )
     con.execute(
         """
         CREATE TABLE IF NOT EXISTS user_kalshi_credentials (
@@ -741,8 +786,8 @@ def create_user(*, email: str, password_hash: str) -> int:
     with connect() as con:
         cur = con.execute(
             """
-            INSERT INTO users (email, password_hash, created_at)
-            VALUES (?, ?, ?)
+            INSERT INTO users (email, password_hash, created_at, plan, subscription_status)
+            VALUES (?, ?, ?, 'pro', 'trialing')
             """,
             (email.strip().lower(), password_hash, now),
         )
@@ -750,10 +795,17 @@ def create_user(*, email: str, password_hash: str) -> int:
         return int(cur.lastrowid)
 
 
+def _user_select_cols() -> str:
+    return (
+        "id, email, password_hash, created_at, stripe_customer_id, stripe_subscription_id, "
+        "plan, subscription_status, COALESCE(is_admin, 0) AS is_admin"
+    )
+
+
 def get_user_by_email(email: str) -> dict[str, Any] | None:
     with connect() as con:
         row = con.execute(
-            "SELECT id, email, password_hash, created_at, stripe_customer_id, stripe_subscription_id, plan, subscription_status FROM users WHERE email = ? COLLATE NOCASE",
+            f"SELECT {_user_select_cols()} FROM users WHERE email = ? COLLATE NOCASE",
             (email.strip().lower(),),
         ).fetchone()
         if not row:
@@ -764,7 +816,7 @@ def get_user_by_email(email: str) -> dict[str, Any] | None:
 def get_user_by_id(user_id: int) -> dict[str, Any] | None:
     with connect() as con:
         row = con.execute(
-            "SELECT id, email, password_hash, created_at, stripe_customer_id, stripe_subscription_id, plan, subscription_status FROM users WHERE id = ?",
+            f"SELECT {_user_select_cols()} FROM users WHERE id = ?",
             (user_id,),
         ).fetchone()
         if not row:
@@ -1409,4 +1461,301 @@ def list_global_daily_picks_for_similarity(*, before_day: str, limit_rows: int =
         }
         for r in rows
     ]
+
+
+# --- Batch test calibration ---
+
+
+def insert_batch_test_pick(
+    *,
+    run_id: str,
+    ticker: str,
+    title: str,
+    category: str,
+    market_implied_yes: float | None,
+    model_yes_probability: float | None,
+    confidence_score: int | None,
+    edge: float | None,
+    recommended_action: str | None,
+    reasoning: str | None,
+    context_sources_used: list[str] | None,
+) -> int:
+    now = int(time.time())
+    ctx = json.dumps(context_sources_used or [])
+    with connect() as con:
+        cur = con.execute(
+            """
+            INSERT INTO batch_test_picks (
+              run_id, ticker, title, category,
+              market_implied_yes, model_yes_probability, confidence_score, edge,
+              recommended_action, reasoning, context_sources_used, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                run_id,
+                ticker,
+                title,
+                category,
+                market_implied_yes,
+                model_yes_probability,
+                confidence_score,
+                edge,
+                recommended_action,
+                reasoning,
+                ctx,
+                now,
+            ),
+        )
+        con.commit()
+        return int(cur.lastrowid)
+
+
+def list_unresolved_batch_test_picks() -> list[dict[str, Any]]:
+    with connect() as con:
+        rows = con.execute(
+            """
+            SELECT id, run_id, ticker, recommended_action
+            FROM batch_test_picks
+            WHERE resolved IS NULL
+            ORDER BY created_at ASC
+            """
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def apply_automatic_batch_test_resolution(
+    *,
+    pick_id: int,
+    resolution_result: str,
+    resolution_correct: bool | None,
+    resolved_at: int,
+) -> bool:
+    with connect() as con:
+        cur = con.execute(
+            """
+            UPDATE batch_test_picks
+            SET resolved = 1,
+                resolution_correct = ?,
+                resolved_at = ?,
+                resolution_result = ?
+            WHERE id = ? AND resolved IS NULL
+            """,
+            (
+                None if resolution_correct is None else (1 if resolution_correct else 0),
+                resolved_at,
+                resolution_result,
+                pick_id,
+            ),
+        )
+        con.commit()
+        return cur.rowcount > 0
+
+
+def list_batch_test_runs() -> list[dict[str, Any]]:
+    with connect() as con:
+        rows = con.execute(
+            """
+            SELECT
+              run_id,
+              MIN(created_at) AS started_at,
+              COUNT(*) AS total_picks,
+              SUM(CASE WHEN resolved = 1 THEN 1 ELSE 0 END) AS resolved_count,
+              SUM(
+                CASE
+                  WHEN resolved = 1
+                    AND recommended_action IN ('BUY_YES', 'BUY_NO')
+                    AND resolution_correct = 1
+                  THEN 1 ELSE 0
+                END
+              ) AS correct_count,
+              SUM(
+                CASE
+                  WHEN resolved = 1 AND recommended_action IN ('BUY_YES', 'BUY_NO')
+                  THEN 1 ELSE 0
+                END
+              ) AS actionable_resolved
+            FROM batch_test_picks
+            GROUP BY run_id
+            ORDER BY started_at DESC
+            """
+        ).fetchall()
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        actionable = int(r["actionable_resolved"] or 0)
+        correct = int(r["correct_count"] or 0)
+        acc = round(100.0 * correct / actionable, 2) if actionable > 0 else None
+        out.append(
+            {
+                "run_id": str(r["run_id"]),
+                "timestamp": int(r["started_at"] or 0),
+                "total_picks": int(r["total_picks"] or 0),
+                "resolved_count": int(r["resolved_count"] or 0),
+                "accuracy_percent": acc,
+            }
+        )
+    return out
+
+
+def list_batch_test_picks_for_run(run_id: str) -> list[dict[str, Any]]:
+    with connect() as con:
+        rows = con.execute(
+            """
+            SELECT *
+            FROM batch_test_picks
+            WHERE run_id = ?
+            ORDER BY id ASC
+            """,
+            (run_id,),
+        ).fetchall()
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        d = dict(r)
+        raw = d.get("context_sources_used")
+        try:
+            d["context_sources_used"] = json.loads(raw) if raw else []
+        except json.JSONDecodeError:
+            d["context_sources_used"] = []
+        d["resolved"] = _row_bool(d.get("resolved"))
+        d["resolution_correct"] = _row_bool(d.get("resolution_correct"))
+        out.append(d)
+    return out
+
+
+def _batch_accuracy_rows(where_sql: str = "", params: tuple[Any, ...] = ()) -> dict[str, Any]:
+    base = f"""
+        SELECT
+          COUNT(*) AS total,
+          SUM(CASE WHEN resolved = 1 THEN 1 ELSE 0 END) AS resolved_n,
+          SUM(
+            CASE WHEN resolved = 1 AND recommended_action IN ('BUY_YES', 'BUY_NO') THEN 1 ELSE 0 END
+          ) AS actionable_resolved,
+          SUM(
+            CASE
+              WHEN resolved = 1
+                AND recommended_action IN ('BUY_YES', 'BUY_NO')
+                AND resolution_correct = 1
+              THEN 1 ELSE 0
+            END
+          ) AS correct_n
+        FROM batch_test_picks
+        {where_sql}
+    """
+    with connect() as con:
+        row = con.execute(base, params).fetchone()
+    total = int(row["total"] or 0)
+    resolved_n = int(row["resolved_n"] or 0)
+    actionable = int(row["actionable_resolved"] or 0)
+    correct = int(row["correct_n"] or 0)
+    acc = round(100.0 * correct / actionable, 2) if actionable > 0 else None
+    return {
+        "total": total,
+        "resolved": resolved_n,
+        "actionable_resolved": actionable,
+        "correct": correct,
+        "accuracy_percent": acc,
+    }
+
+
+def get_batch_test_accuracy_stats() -> dict[str, Any]:
+    overall = _batch_accuracy_rows()
+    with connect() as con:
+        cats = con.execute(
+            """
+            SELECT DISTINCT COALESCE(category, 'Unknown') AS category
+            FROM batch_test_picks
+            ORDER BY category
+            """
+        ).fetchall()
+        actions = con.execute(
+            """
+            SELECT DISTINCT recommended_action AS action
+            FROM batch_test_picks
+            WHERE recommended_action IN ('BUY_YES', 'BUY_NO')
+            """
+        ).fetchall()
+    by_category = {
+        str(r["category"]): _batch_accuracy_rows("WHERE COALESCE(category, 'Unknown') = ?", (str(r["category"]),))
+        for r in cats
+    }
+    by_action = {
+        str(r["action"]): _batch_accuracy_rows("WHERE recommended_action = ?", (str(r["action"]),))
+        for r in actions
+    }
+    bands = [
+        ("40-50", 40, 50),
+        ("50-60", 50, 60),
+        ("60-70", 60, 70),
+        ("70+", 70, 101),
+    ]
+    by_confidence: dict[str, Any] = {}
+    for label, lo, hi in bands:
+        if label == "70+":
+            where = "WHERE confidence_score >= ?"
+            params: tuple[Any, ...] = (lo,)
+        else:
+            where = "WHERE confidence_score >= ? AND confidence_score < ?"
+            params = (lo, hi)
+        by_confidence[label] = _batch_accuracy_rows(where, params)
+    return {
+        "overall": overall,
+        "by_category": by_category,
+        "by_recommended_action": by_action,
+        "by_confidence_band": by_confidence,
+    }
+
+
+# --- On-demand Pro usage (daily_usage table) ---
+
+_ON_DEMAND_PRO_PER_DAY = 20
+
+
+def assert_on_demand_allowed(*, user_id: int, is_pro: bool) -> None:
+    from fastapi import HTTPException
+
+    if not is_pro:
+        raise HTTPException(
+            status_code=403,
+            detail="On-demand market analysis requires an active Pro subscription or free trial.",
+        )
+    day = _utc_day_string()
+    with connect() as con:
+        row = con.execute(
+            "SELECT on_demand_count FROM daily_usage WHERE user_id = ? AND day = ?",
+            (user_id, day),
+        ).fetchone()
+        c = int(row["on_demand_count"]) if row else 0
+        if c >= _ON_DEMAND_PRO_PER_DAY:
+            raise HTTPException(
+                status_code=429,
+                detail=(
+                    f"Daily on-demand analysis limit reached ({_ON_DEMAND_PRO_PER_DAY} per UTC day). "
+                    "Try again tomorrow."
+                ),
+            )
+
+
+def record_on_demand_use(user_id: int) -> None:
+    day = _utc_day_string()
+    with connect() as con:
+        con.execute(
+            """
+            INSERT INTO daily_usage (user_id, day, on_demand_count)
+            VALUES (?, ?, 1)
+            ON CONFLICT(user_id, day) DO UPDATE SET
+              on_demand_count = on_demand_count + 1
+            """,
+            (user_id, day),
+        )
+        con.commit()
+
+
+def get_on_demand_usage_today(user_id: int) -> dict[str, int]:
+    day = _utc_day_string()
+    with connect() as con:
+        row = con.execute(
+            "SELECT on_demand_count FROM daily_usage WHERE user_id = ? AND day = ?",
+            (user_id, day),
+        ).fetchone()
+    used = int(row["on_demand_count"]) if row else 0
+    return {"used": used, "limit": _ON_DEMAND_PRO_PER_DAY, "remaining": max(0, _ON_DEMAND_PRO_PER_DAY - used)}
 
