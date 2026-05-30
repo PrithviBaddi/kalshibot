@@ -13,6 +13,7 @@ from app.api_auth import get_api_token
 from app.batch_test_job import run_batch_analyze_background
 from app.db import (
     get_batch_test_accuracy_stats,
+    get_combined_calibration_accuracy_stats,
     get_user_by_id,
     list_batch_test_picks_for_run,
     list_batch_test_runs,
@@ -27,6 +28,10 @@ _batch_tasks: dict[str, asyncio.Task[Any]] = {}
 class BatchAnalyzeBody(BaseModel):
     categories: list[str] | None = None
     top_n: int = Field(default=30, ge=1, le=100)
+    actionable_only: bool = Field(
+        default=True,
+        description="If true, only store BUY_YES/BUY_NO picks and keep evaluating until top_n are saved.",
+    )
 
 
 def _require_testing_admin(request: Request) -> None:
@@ -53,7 +58,12 @@ async def batch_analyze(request: Request, body: BatchAnalyzeBody) -> dict[str, A
     _require_testing_admin(request)
     run_id = str(uuid.uuid4())
     task = asyncio.create_task(
-        run_batch_analyze_background(run_id, body.categories, top_n=body.top_n)
+        run_batch_analyze_background(
+            run_id,
+            body.categories,
+            top_n=body.top_n,
+            actionable_only=body.actionable_only,
+        )
     )
     _batch_tasks[run_id] = task
 
@@ -65,7 +75,7 @@ async def batch_analyze(request: Request, body: BatchAnalyzeBody) -> dict[str, A
             pass
 
     task.add_done_callback(_done)
-    return {"ok": True, "run_id": run_id, "status": "started", "top_n": body.top_n}
+    return {"ok": True, "run_id": run_id, "status": "started", "top_n": body.top_n, "actionable_only": body.actionable_only}
 
 
 @router.get("/batch-runs")
@@ -89,4 +99,12 @@ async def batch_run_detail(request: Request, run_id: str) -> dict[str, Any]:
 async def batch_accuracy(request: Request) -> dict[str, Any]:
     _require_testing_admin(request)
     stats = get_batch_test_accuracy_stats()
+    return {"ok": True, **stats}
+
+
+@router.get("/calibration-accuracy")
+async def combined_calibration_accuracy(request: Request) -> dict[str, Any]:
+    """Combined BUY_YES/BUY_NO accuracy across daily picks + batch test picks."""
+    _require_testing_admin(request)
+    stats = get_combined_calibration_accuracy_stats()
     return {"ok": True, **stats}

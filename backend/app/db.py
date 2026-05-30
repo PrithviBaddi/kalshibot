@@ -1704,6 +1704,86 @@ def get_batch_test_accuracy_stats() -> dict[str, Any]:
     }
 
 
+def get_combined_calibration_accuracy_stats() -> dict[str, Any]:
+    """
+    Merged calibration: daily picks (non-invalid) + batch test picks.
+    Only BUY_YES/BUY_NO with resolved outcomes count toward accuracy %.
+    """
+    with connect() as con:
+        daily = con.execute(
+            """
+            SELECT recommended_action, resolved, resolution_correct, invalid, 'daily' AS source
+            FROM global_daily_picks
+            """
+        ).fetchall()
+        batch = con.execute(
+            """
+            SELECT recommended_action, resolved, resolution_correct, 'batch' AS source
+            FROM batch_test_picks
+            """
+        ).fetchall()
+
+    def norm_action(a: Any) -> str:
+        s = str(a or "PASS").upper().strip().replace(" ", "_").replace("-", "_")
+        return s if s in ("BUY_YES", "BUY_NO", "PASS") else "PASS"
+
+    daily_rows = [dict(r) for r in daily if int(r["invalid"] or 0) == 0]
+    batch_rows = [dict(r) for r in batch]
+
+    all_directional = [
+        r
+        for r in daily_rows + batch_rows
+        if norm_action(r.get("recommended_action")) in ("BUY_YES", "BUY_NO")
+    ]
+    resolved_scored = [
+        r
+        for r in daily_rows + batch_rows
+        if r.get("resolved") is not None
+        and int(r["resolved"]) == 1
+        and norm_action(r.get("recommended_action")) in ("BUY_YES", "BUY_NO")
+        and r.get("resolution_correct") is not None
+    ]
+    correct = sum(1 for r in resolved_scored if int(r["resolution_correct"]) == 1)
+    incorrect = sum(1 for r in resolved_scored if int(r["resolution_correct"]) == 0)
+    denom = correct + incorrect
+    acc = round(100.0 * correct / denom, 2) if denom > 0 else None
+
+    daily_dir = [r for r in daily_rows if norm_action(r.get("recommended_action")) in ("BUY_YES", "BUY_NO")]
+    batch_dir = [r for r in batch_rows if norm_action(r.get("recommended_action")) in ("BUY_YES", "BUY_NO")]
+
+    def _source_stats(rows: list[dict[str, Any]]) -> dict[str, Any]:
+        scored = [
+            r
+            for r in rows
+            if r.get("resolved") is not None
+            and int(r["resolved"]) == 1
+            and norm_action(r.get("recommended_action")) in ("BUY_YES", "BUY_NO")
+            and r.get("resolution_correct") is not None
+        ]
+        c = sum(1 for r in scored if int(r["resolution_correct"]) == 1)
+        ic = sum(1 for r in scored if int(r["resolution_correct"]) == 0)
+        d = c + ic
+        return {
+            "total_directional": len([r for r in rows if norm_action(r.get("recommended_action")) in ("BUY_YES", "BUY_NO")]),
+            "resolved_scored": d,
+            "correct": c,
+            "incorrect": ic,
+            "accuracy_percent": round(100.0 * c / d, 2) if d > 0 else None,
+        }
+
+    return {
+        "overall": {
+            "total_directional": len(all_directional),
+            "resolved_scored": denom,
+            "correct": correct,
+            "incorrect": incorrect,
+            "accuracy_percent": acc,
+        },
+        "daily_picks": _source_stats(daily_rows),
+        "batch_test_picks": _source_stats(batch_rows),
+    }
+
+
 # --- On-demand Pro usage (daily_usage table) ---
 
 _ON_DEMAND_PRO_PER_DAY = 20
