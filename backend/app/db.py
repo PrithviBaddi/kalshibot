@@ -195,6 +195,22 @@ def _saas_extras_migrate(con: sqlite3.Connection) -> None:
     )
     con.execute(
         """
+        CREATE TABLE IF NOT EXISTS batch_test_runs (
+          run_id TEXT PRIMARY KEY,
+          started_at INTEGER NOT NULL,
+          finished_at INTEGER,
+          target INTEGER NOT NULL,
+          stored INTEGER NOT NULL DEFAULT 0,
+          evaluated INTEGER NOT NULL DEFAULT 0,
+          pass_skipped INTEGER NOT NULL DEFAULT 0,
+          pool_size INTEGER NOT NULL DEFAULT 0,
+          status TEXT NOT NULL DEFAULT 'running',
+          message TEXT
+        )
+        """
+    )
+    con.execute(
+        """
         CREATE TABLE IF NOT EXISTS password_reset_tokens (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           user_id INTEGER NOT NULL,
@@ -1466,6 +1482,53 @@ def list_global_daily_picks_for_similarity(*, before_day: str, limit_rows: int =
 # --- Batch test calibration ---
 
 
+def insert_batch_test_run(
+    *,
+    run_id: str,
+    target: int,
+    pool_size: int,
+) -> None:
+    now = int(time.time())
+    with connect() as con:
+        con.execute(
+            """
+            INSERT INTO batch_test_runs (run_id, started_at, target, pool_size, status)
+            VALUES (?, ?, ?, ?, 'running')
+            """,
+            (run_id, now, target, pool_size),
+        )
+        con.commit()
+
+
+def finish_batch_test_run(
+    *,
+    run_id: str,
+    stored: int,
+    evaluated: int,
+    pass_skipped: int,
+    status: str,
+    message: str,
+) -> None:
+    now = int(time.time())
+    with connect() as con:
+        con.execute(
+            """
+            UPDATE batch_test_runs
+            SET finished_at = ?, stored = ?, evaluated = ?, pass_skipped = ?,
+                status = ?, message = ?
+            WHERE run_id = ?
+            """,
+            (now, stored, evaluated, pass_skipped, status, message, run_id),
+        )
+        con.commit()
+
+
+def get_batch_test_run(run_id: str) -> dict[str, Any] | None:
+    with connect() as con:
+        row = con.execute("SELECT * FROM batch_test_runs WHERE run_id = ?", (run_id,)).fetchone()
+    return dict(row) if row else None
+
+
 def insert_batch_test_pick(
     *,
     run_id: str,
@@ -1556,26 +1619,64 @@ def list_batch_test_runs() -> list[dict[str, Any]]:
         rows = con.execute(
             """
             SELECT
-              run_id,
-              MIN(created_at) AS started_at,
-              COUNT(*) AS total_picks,
-              SUM(CASE WHEN resolved = 1 THEN 1 ELSE 0 END) AS resolved_count,
+              r.run_id,
+              COALESCE(r.started_at, MIN(p.created_at)) AS started_at,
+              r.finished_at,
+              r.target,
+              r.status,
+              r.message,
+              r.pool_size,
+              r.evaluated,
+              r.pass_skipped,
+              COUNT(p.id) AS total_picks,
+              SUM(CASE WHEN p.resolved = 1 THEN 1 ELSE 0 END) AS resolved_count,
               SUM(
                 CASE
-                  WHEN resolved = 1
-                    AND recommended_action IN ('BUY_YES', 'BUY_NO')
-                    AND resolution_correct = 1
+                  WHEN p.resolved = 1
+                    AND p.recommended_action IN ('BUY_YES', 'BUY_NO')
+                    AND p.resolution_correct = 1
                   THEN 1 ELSE 0
                 END
               ) AS correct_count,
               SUM(
                 CASE
-                  WHEN resolved = 1 AND recommended_action IN ('BUY_YES', 'BUY_NO')
+                  WHEN p.resolved = 1 AND p.recommended_action IN ('BUY_YES', 'BUY_NO')
                   THEN 1 ELSE 0
                 END
               ) AS actionable_resolved
-            FROM batch_test_picks
-            GROUP BY run_id
+            FROM batch_test_runs r
+            LEFT JOIN batch_test_picks p ON p.run_id = r.run_id
+            GROUP BY r.run_id
+            UNION ALL
+            SELECT
+              p.run_id,
+              MIN(p.created_at) AS started_at,
+              NULL AS finished_at,
+              NULL AS target,
+              'legacy' AS status,
+              NULL AS message,
+              NULL AS pool_size,
+              NULL AS evaluated,
+              NULL AS pass_skipped,
+              COUNT(*) AS total_picks,
+              SUM(CASE WHEN p.resolved = 1 THEN 1 ELSE 0 END) AS resolved_count,
+              SUM(
+                CASE
+                  WHEN p.resolved = 1
+                    AND p.recommended_action IN ('BUY_YES', 'BUY_NO')
+                    AND p.resolution_correct = 1
+                  THEN 1 ELSE 0
+                END
+              ) AS correct_count,
+              SUM(
+                CASE
+                  WHEN p.resolved = 1 AND p.recommended_action IN ('BUY_YES', 'BUY_NO')
+                  THEN 1 ELSE 0
+                END
+              ) AS actionable_resolved
+            FROM batch_test_picks p
+            WHERE p.run_id NOT IN (SELECT run_id FROM batch_test_runs)
+            GROUP BY p.run_id
             ORDER BY started_at DESC
             """
         ).fetchall()
@@ -1588,6 +1689,13 @@ def list_batch_test_runs() -> list[dict[str, Any]]:
             {
                 "run_id": str(r["run_id"]),
                 "timestamp": int(r["started_at"] or 0),
+                "finished_at": int(r["finished_at"]) if r["finished_at"] else None,
+                "status": str(r["status"] or "unknown"),
+                "message": str(r["message"]) if r["message"] else None,
+                "target": int(r["target"]) if r["target"] is not None else None,
+                "pool_size": int(r["pool_size"]) if r["pool_size"] is not None else None,
+                "evaluated": int(r["evaluated"]) if r["evaluated"] is not None else None,
+                "pass_skipped": int(r["pass_skipped"]) if r["pass_skipped"] is not None else None,
                 "total_picks": int(r["total_picks"] or 0),
                 "resolved_count": int(r["resolved_count"] or 0),
                 "accuracy_percent": acc,

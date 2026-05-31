@@ -207,16 +207,24 @@ async def _gather_filtered_for_categories(
     *,
     max_spread: float,
     min_volume: float,
+    max_series: int | None = None,
+    per_series_limit: int | None = None,
+    min_days: int | None = None,
+    max_days: int | None = None,
 ) -> tuple[list[dict[str, Any]], int]:
     merged: list[dict[str, Any]] = []
     raw_total = 0
+    series_cap = max_series if max_series is not None else int(os.getenv("DAILY_PICK_MAX_SERIES", "80"))
+    per_limit = per_series_limit if per_series_limit is not None else int(
+        os.getenv("DAILY_PICK_MARKETS_PER_SERIES", "100")
+    )
+    resolve_min = min_days if min_days is not None else _MIN_DAYS_TO_RESOLVE
+    resolve_max = max_days if max_days is not None else _MAX_DAYS_TO_RESOLVE
     for cat in categories:
         ser = await k.get_series_list(category=cat)
         series_list = ser.get("series") or []
         all_markets: list[dict[str, Any]] = []
-        max_series = int(os.getenv("DAILY_PICK_MAX_SERIES", "80"))
-        per_limit = int(os.getenv("DAILY_PICK_MARKETS_PER_SERIES", "100"))
-        for s in series_list[:max_series]:
+        for s in series_list[:series_cap]:
             st = s.get("ticker")
             if not st:
                 continue
@@ -232,8 +240,8 @@ async def _gather_filtered_for_categories(
         deduped,
         max_spread=max_spread,
         min_volume=min_volume,
-        min_days=_MIN_DAYS_TO_RESOLVE,
-        max_days=_MAX_DAYS_TO_RESOLVE,
+        min_days=resolve_min,
+        max_days=resolve_max,
         pick_category=pick_cat,
     )
     return filtered, raw_total
@@ -751,6 +759,15 @@ async def run_daily_pick_generation() -> dict[str, Any]:
             await k.aclose()
 
 
+def batch_test_default_categories() -> list[str]:
+    raw = os.getenv(
+        "BATCH_TEST_CATEGORIES",
+        "Politics,Economics,Financials,Climate and Weather,Science and Technology,"
+        "Entertainment,Elections,Companies,Health,World",
+    )
+    return [c.strip() for c in raw.split(",") if c.strip()]
+
+
 async def gather_top_scored_candidates(
     k: KalshiClient,
     categories: list[str],
@@ -758,25 +775,55 @@ async def gather_top_scored_candidates(
     top_n: int = 30,
 ) -> list[dict[str, Any]]:
     """Scan categories, merge filtered pools, return top N by scanner score (deduped by ticker)."""
+    pool = await gather_batch_calibration_pool(k, categories, max_pool=max(top_n, 60))
+    return pool[: max(1, int(top_n))]
+
+
+async def gather_batch_calibration_pool(
+    k: KalshiClient,
+    categories: list[str] | None,
+    *,
+    max_pool: int | None = None,
+) -> list[dict[str, Any]]:
+    """
+    Wide scanner pool for batch calibration — more categories, relaxed filters, larger series sweep.
+  Returns up to max_pool ranked candidates (not capped to daily-pick's ~18 market window).
+    """
+    cats = [c.strip() for c in (categories or batch_test_default_categories()) if c.strip()]
+    if not cats:
+        cats = batch_test_default_categories()
+    cap = max_pool if max_pool is not None else int(os.getenv("BATCH_TEST_MAX_POOL", "400"))
+    series_cap = int(os.getenv("BATCH_TEST_MAX_SERIES", "120"))
+    per_limit = int(os.getenv("BATCH_TEST_MARKETS_PER_SERIES", "100"))
+    min_days = int(os.getenv("BATCH_TEST_MIN_DAYS", str(_MIN_DAYS_TO_RESOLVE)))
+    max_days = int(os.getenv("BATCH_TEST_MAX_DAYS", str(_MAX_DAYS_TO_RESOLVE)))
+
+    filter_tiers: list[tuple[float, float]] = [
+        (_MAX_SPREAD_RELAXED, _MIN_VOLUME_RELAXED),
+        (0.22, 200.0),
+        (0.30, 100.0),
+    ]
+
     merged: list[dict[str, Any]] = []
-    for cat in categories:
-        filtered, _raw = await _gather_filtered_for_categories(
-            k,
-            [cat],
-            max_spread=_MAX_SPREAD,
-            min_volume=_MIN_VOLUME,
-        )
-        if not filtered:
+    for max_spread, min_vol in filter_tiers:
+        merged = []
+        for cat in cats:
             filtered, _raw = await _gather_filtered_for_categories(
                 k,
                 [cat],
-                max_spread=_MAX_SPREAD_RELAXED,
-                min_volume=_MIN_VOLUME_RELAXED,
+                max_spread=max_spread,
+                min_volume=min_vol,
+                max_series=series_cap,
+                per_series_limit=per_limit,
+                min_days=min_days,
+                max_days=max_days,
             )
-        for row in filtered:
-            row = dict(row)
-            row["source_category"] = cat
-            merged.append(row)
+            for row in filtered:
+                row = dict(row)
+                row["source_category"] = cat
+                merged.append(row)
+        if len(merged) >= cap // 2:
+            break
 
     best_by_ticker: dict[str, dict[str, Any]] = {}
     for row in merged:
@@ -792,7 +839,13 @@ async def gather_top_scored_candidates(
         key=lambda x: (float(x["scan"].get("score") or 0), float(x["scan"].get("volume") or 0)),
         reverse=True,
     )
-    return ranked[: max(1, int(top_n))]
+    logger.info(
+        "gather_batch_calibration_pool: categories=%s unique_candidates=%s cap=%s",
+        len(cats),
+        len(ranked),
+        cap,
+    )
+    return ranked[: max(1, cap)]
 
 
 async def evaluate_market_for_pick(

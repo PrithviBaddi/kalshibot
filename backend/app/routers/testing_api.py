@@ -13,6 +13,7 @@ from app.api_auth import get_api_token
 from app.batch_test_job import run_batch_analyze_background
 from app.db import (
     get_batch_test_accuracy_stats,
+    get_batch_test_run,
     get_combined_calibration_accuracy_stats,
     get_user_by_id,
     list_batch_test_picks_for_run,
@@ -87,12 +88,17 @@ async def batch_runs(request: Request) -> dict[str, Any]:
 @router.get("/batch-runs/{run_id}")
 async def batch_run_detail(request: Request, run_id: str) -> dict[str, Any]:
     _require_testing_admin(request)
+    meta = get_batch_test_run(run_id)
     picks = list_batch_test_picks_for_run(run_id)
-    if not picks:
-        runs = {r["run_id"] for r in list_batch_test_runs()}
-        if run_id not in runs and run_id not in _batch_tasks:
-            raise HTTPException(status_code=404, detail="Batch run not found.")
-    return {"ok": True, "run_id": run_id, "picks": picks}
+    if not picks and not meta and run_id not in _batch_tasks:
+        raise HTTPException(status_code=404, detail="Batch run not found.")
+    return {
+        "ok": True,
+        "run_id": run_id,
+        "run": meta,
+        "picks": picks,
+        "running": run_id in _batch_tasks,
+    }
 
 
 @router.get("/accuracy")
